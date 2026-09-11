@@ -60,12 +60,13 @@ The desktop app checks for a new release when it starts, every hour while it run
 
 Linux desktop installs from the release tarball's `install.sh` use the same `~/.zeron/app` layout as the curl installer, so they update in place too. A daemon installed as a service restarts into a newer installed version once no agent run or terminal is active; `zeron update` updates headless installs on demand.
 
+Prefer to keep sync off other people's servers? The edge can run on your own machine with `docker compose`, no Cloudflare or WorkOS account needed — see [docs/SELFHOST.md](docs/SELFHOST.md).
+
 ## Sponsors
 
 Thank you to [The Context Company](https://www.thecontextcompany.com/) for sponsoring Zeron.
 
 You can help fund Zeron's development too. Individuals and companies are welcome to [become a sponsor on GitHub](https://github.com/sponsors/zeronsh).
-
 ---
 
 Developing or curious how it works? [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/zeronsh/zeron) or check out [ARCHITECTURE.md](ARCHITECTURE.md).
