@@ -45,6 +45,8 @@ zeron daemon start
 
 Devices signed in to the same account can read and write each other's workspace files, so only sign in devices you trust. Existing local sessions are never uploaded.
 
+Prefer to keep sync off other people's servers? The edge can run on your own machine with `docker compose`, no Cloudflare or WorkOS account needed — see [docs/SELFHOST.md](docs/SELFHOST.md).
+
 ## Sponsors
 
 Thank you to [The Context Company](https://www.thecontextcompany.com/) for sponsoring Zeron. You can help fund Zeron's development too by [becoming a sponsor on GitHub](https://github.com/sponsors/zeronsh).

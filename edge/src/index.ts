@@ -47,7 +47,7 @@
  *   POST /admin/cloud/machine           — ADMIN_TOKEN (a user's machine size)
  *   POST /stripe/webhook | GET /billing/done — pre-bearer billing (Stripe-signed / static page)
  */
-import { authenticate } from "./auth";
+import { authMode, authenticate, selfhostIdentity } from "./auth";
 import { chatRoute } from "./chat-route";
 import { deviceParam, forward } from "./forward";
 import { handleAuthRoute } from "./auth-routes";
@@ -106,7 +106,14 @@ export default {
     const parts = url.pathname.split("/").filter(Boolean);
 
     if (url.pathname === "/health") {
-      return json({ ok: true, auth: env.AUTH_MODE === "dev" ? "dev" : "workos" });
+      const mode = authMode(env);
+      if (mode === "none") {
+        // Self-host: advertise the fixed identity so engines adopt it without
+        // any out-of-band `user@org` configuration.
+        const id = selfhostIdentity(env);
+        return json({ ok: true, auth: mode, userId: id.userId, orgId: id.orgId });
+      }
+      return json({ ok: true, auth: mode });
     }
 
     // ── public install surface (also routed from zeron.sh): the
