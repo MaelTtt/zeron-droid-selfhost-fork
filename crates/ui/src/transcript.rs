@@ -3283,6 +3283,9 @@ pub enum TranscriptEvent {
         title: String,
         frozen: bool,
     },
+    /// The rewind action on a sent user message: put that prompt back in
+    /// the composer. `entry_id` is the user message entry.
+    RewindTo { entry_id: String },
 }
 
 impl gpui::EventEmitter<TranscriptEvent> for Transcript {}
@@ -6596,12 +6599,40 @@ impl Transcript {
                         .text_color(theme.text_muted),
                     )
             });
+            let rewind = is_user_row.then(|| {
+                let entry_id = copy_entry_id.clone();
+                let fade_key = format!("rewind-message-hover-{entry_id}");
+                div()
+                    .id(SharedString::from(format!("rewind-message-{entry_id}")))
+                    .size(px(Theme::SPACE_MD * 2.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(Theme::CONTROL_RADIUS))
+                    .cursor_pointer()
+                    .bg(motion::hover_blend(
+                        &fade_key,
+                        gpui::transparent_black(),
+                        crate::theme::ink(0.08),
+                    ))
+                    .on_hover(motion::hover_listener(fade_key))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(TranscriptEvent::RewindTo {
+                            entry_id: entry_id.to_string(),
+                        })
+                    }))
+                    .child(
+                        crate::icons::icon(crate::icons::RESTART)
+                            .size(px(14.0))
+                            .text_color(theme.text_muted),
+                    )
+            });
             let metadata = div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap(px(Theme::SPACE_SM));
-            let metadata = metadata.child(timestamp).children(copy);
+            let metadata = metadata.child(timestamp).children(rewind).children(copy);
             div()
                 .h(px(Theme::SPACE_SM + Theme::SPACE_MD * 2.0))
                 .pt(px(Theme::SPACE_SM))

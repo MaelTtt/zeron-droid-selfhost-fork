@@ -49,6 +49,7 @@ pub mod popover;
 pub mod project_actions;
 pub mod queue;
 pub mod rail;
+pub mod rewind;
 pub mod settings;
 pub mod shell;
 pub mod sound;
