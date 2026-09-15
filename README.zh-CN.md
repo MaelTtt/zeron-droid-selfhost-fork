@@ -1,7 +1,6 @@
 # Zeron
 
-在本地管理你的编码 agent（Claude Code、Codex、Cursor、Grok、Hermes、Pi、Antigravity），也可以打开多设备同步。
-
+在本地管理你的编码 agent（Claude Code、Codex、Cursor、Devin、Factory Droid、Grok、Hermes、Pi、Antigravity），也可以打开多设备同步。
 *[English](README.md) | 简体中文*
 
 ![Zeron 驱动一个 Claude Code 会话，侧边栏是实时的分支 diff](apps/landing/public/assets/app-screenshot.jpg)

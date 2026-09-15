@@ -22,6 +22,7 @@ async fn cli_on_login_shell_path_only_is_resolved() {
     let shell_bin = dir.path().join("shell-bin");
     std::fs::create_dir(&shell_bin).unwrap();
     write_executable(&shell_bin.join("devin"), "#!/bin/sh\nexit 0\n");
+    write_executable(&shell_bin.join("droid"), "#!/bin/sh\nexit 0\n");
     write_executable(&shell_bin.join("hermes"), "#!/bin/sh\nexit 0\n");
     // Native discovery prefers the newest installed version; outrank any real CLI.
     write_executable(&shell_bin.join("pi"), "#!/bin/sh\necho 9999.0.0\n");
@@ -49,6 +50,7 @@ async fn cli_on_login_shell_path_only_is_resolved() {
         std::env::set_var("HOME", dir.path());
         std::env::set_var("PATH", "/usr/bin:/bin");
         std::env::remove_var("DEVIN_EXECUTABLE");
+        std::env::remove_var("DROID_EXECUTABLE");
         std::env::remove_var("HERMES_EXECUTABLE");
         std::env::remove_var("PI_EXECUTABLE");
         std::env::remove_var("CLAUDE_CODE_EXECUTABLE");
@@ -74,6 +76,10 @@ async fn cli_on_login_shell_path_only_is_resolved() {
         .launch_program()
         .expect("devin resolves via login-shell PATH");
     assert_eq!(devin, shell_bin.join("devin"), "{devin:?}");
+    let droid = AcpHarness::droid()
+        .launch_program()
+        .expect("droid resolves via login-shell PATH");
+    assert_eq!(droid, shell_bin.join("droid"), "{droid:?}");
     let hermes = AcpHarness::hermes()
         .launch_program()
         .expect("hermes resolves via login-shell PATH");
