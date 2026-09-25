@@ -52,6 +52,22 @@ It does, in this order:
    Auth:     dev mode (bearer = user id)
    ```
 
+## Theme (BlackViolet)
+
+The bundle lives in the repo at [`themes/black-violet/`](../themes/black-violet) (dark + light
+variants + `package.json`, mapped from mael's Noctalia palette). The install script copies it
+to `~/.config/zeron-themes/black-violet/`.
+
+One-time per machine, import it in the UI:
+
+1. Zeron -> **Settings -> Appearance -> Themes -> Add theme**
+2. Choose **Link to source** -> `~/.config/zeron-themes/black-violet/package.json`
+3. In the mapping review, tick **Dark** and **Light** -> **Import**
+4. Appearance -> set **Dark theme: Black Violet Dark**, **Light theme: Black Violet Light**
+
+It's a *linked* theme: because it points at the copied repo bundle, a future
+`git pull` + re-import/reload picks up any color tweaks without redoing the flow.
+
 ## First launch
 
 - Open your launcher (rofi/krunner/GNOME menu) and type **Zeron**. The sidebar lists every device in the shared `local@local` workspace (desktop, silverhand, any other machine running the fork against the same edge).

@@ -97,6 +97,20 @@ command -v update-desktop-database >/dev/null && update-desktop-database "$HOME/
 command -v kbuildsycoca6 >/dev/null && kbuildsycoca6 --noincremental >/dev/null 2>&1 || true
 command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" >/dev/null 2>&1 || true
 
+say "theme bundle (BlackViolet, from Noctalia palette)"
+THEME_DIR="$HOME/.config/zeron-themes"
+mkdir -p "$THEME_DIR"
+cp -r "$CLONE_DIR/themes/black-violet" "$THEME_DIR/"
+cat <<'''THEME'''
+Theme files copied to ~/.config/zeron-themes/black-violet.
+One-time UI import (per machine):
+  Zeron -> Settings -> Appearance -> Themes -> Add theme -> "Link to source"
+  -> select ~/.config/zeron-themes/black-violet/package.json
+  -> tick the Dark and Light variants -> Import.
+  Then Appearance -> Dark theme: Black Violet Dark; Light theme: Black Violet Light.
+(Linked stays fresh: future fork pulls auto-update the theme on reload.)
+THEME
+
 say "point this device at the homelab edge"
 mkdir -p "$HOME/.zeron"
 # note: DROID/OPENCODE auth files are per-machine; installing those CLIs is up to you
