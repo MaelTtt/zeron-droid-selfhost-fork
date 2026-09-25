@@ -49,56 +49,74 @@ if ! command -v cargo >/dev/null; then
 fi
 rustc --version
 
-say "clone fork into $CLONE_DIR"
+say "clone/pull fork into $CLONE_DIR"
 mkdir -p "$(dirname "$CLONE_DIR")"
 if [ ! -d "$CLONE_DIR/.git" ]; then
     git clone -b mael/main "$REPO" "$CLONE_DIR"
 else
-    git -C "$CLONE_DIR" pull --ff-only origin mael/main
+    cd "$CLONE_DIR"
+    git fetch origin mael/main -q
+    git reset --hard origin/mael/main -q   # install dir: remote is source of truth
+    git clean -fdq target 2>/dev/null || true
 fi
 cd "$CLONE_DIR"
 
 say "build (release; grab a coffee, ~10-20 min)"
 cargo build --release -p zeron
 
-say "install binary as the fork app"
-# the running engine holds the binary (ETXTBSY) — stop it for the swap
-systemctl --user stop zeron.service 2>/dev/null || pkill -x zeron 2>/dev/null || true
-sleep 1
-mkdir -p "$HOME/.zeron/app/local-mael"
-cp target/release/zeron "$HOME/.zeron/app/local-mael/zeron"
-echo "mael fork — rebuild via zeron-fork-update or re-clone" \
-    > "$HOME/.zeron/app/local-mael/.mael-fork"
-ln -sfn "$HOME/.zeron/app/local-mael" "$HOME/.zeron/app/current"
+BUILT="$CLONE_DIR/target/release/zeron"
+NEWVER="$($BUILT --version | awk '{print \$2}')"
+
+say "install / update fork binary (versioned, no ETXTBSY)"
+# Layout: one dir per build under ~/.zeron/app/, 'current' symlink selects.
+# Never overwrite a binary a process may be running: new version -> new dir,
+# then repoint current + restart. Identical build -> nothing to do.
+mkdir -p "$HOME/.zeron/app"
+CURRENT="$HOME/.zeron/app/current"
+TARGET_DIR="$HOME/.zeron/app/fork-$NEWVER"
+RUNNING=""
+
+if [ -x "$HOME/.zeron/app/current/zeron" ]; then
+    CURVER="$("$HOME/.zeron/app/current/zeron" --version 2>/dev/null | awk '{print \$2}')"
+    CURSHA="$(sha256sum "$HOME/.zeron/app/current/zeron" 2>/dev/null | cut -d' ' -f1)"
+    NEWSHA="$(sha256sum "$BUILT" | cut -d' ' -f1)"
+    RUNNING="$(pgrep -x zeron | head -1 || true)"
+    if [ "$CURSHA" = "$NEWSHA" ]; then
+        say "already running $CURVER — same build, skipping swap"
+    else
+        echo "updating: $CURVER -> $NEWVER"
+        rm -rf "$TARGET_DIR"
+        mkdir -p "$TARGET_DIR"
+        cp "$BUILT" "$TARGET_DIR/zeron"          # fresh dir: cannot be Text-busy
+        echo 'mael fork — see docs/INSTALL-DESKTOP.md' > "$TARGET_DIR/.mael-fork"
+        ln -sfn "$TARGET_DIR" "$HOME/.zeron/app/current"
+        # bounce only if an engine is actually running
+        if [ -n "$RUNNING" ]; then
+            say "restarting engine (was running pid $RUNNING)"
+            if systemctl --user list-unit-files 2>/dev/null | grep -q '^zeron.service'; then
+                systemctl --user restart zeron.service
+            else
+                pkill -x zeron || true
+                sleep 1
+            fi
+        fi
+    fi
+else
+    rm -rf "$TARGET_DIR"
+    mkdir -p "$TARGET_DIR"
+    cp "$BUILT" "$TARGET_DIR/zeron"
+    echo 'mael fork — see docs/INSTALL-DESKTOP.md' > "$TARGET_DIR/.mael-fork"
+    ln -sfn "$TARGET_DIR" "$HOME/.zeron/app/current"
+fi
+
+# prune old fork installs, keep the newest 2
+ls -1d "$HOME/.zeron/app/fork-"[0-9]* 2>/dev/null \
+  | grep -v "$(readlink "$HOME/.zeron/app/current" 2>/dev/null)" \
+  | sort -V | head -n -2 | xargs -r rm -rf
+
 export PATH="$HOME/.local/bin:$PATH"
 mkdir -p "$HOME/.local/bin"
 ln -sf "$HOME/.zeron/app/current/zeron" "$HOME/.local/bin/zeron"
-
-say "desktop entry + icon (so it shows in your launcher)"
-mkdir -p "$HOME/.local/share/applications" "$HOME/.local/share/icons/hicolor/512x512/apps"
-cat > "$HOME/.local/share/applications/zeron.desktop" <<DESKTOP
-[Desktop Entry]
-Type=Application
-Name=Zeron
-GenericName=Coding Agent Controller
-Comment=mael fork — droid + selfhost
-Exec=$HOME/.zeron/app/current/zeron %u
-TryExec=$HOME/.zeron/app/current/zeron
-Icon=zeron
-Terminal=false
-Categories=Development;
-Keywords=agent;droid;claude;codex;ai;coding;
-StartupWMClass=zeron
-MimeType=x-scheme-handler/zeron;
-DESKTOP
-if [ -f "$CLONE_DIR/apps/landing/public/assets/zeron.png" ]; then
-    cp "$CLONE_DIR/apps/landing/public/assets/zeron.png" \
-       "$HOME/.local/share/icons/hicolor/512x512/apps/zeron.png"
-fi
-command -v update-desktop-database >/dev/null && update-desktop-database "$HOME/.local/share/applications/"
-# KDE/Hyprland launcher caches
-command -v kbuildsycoca6 >/dev/null && kbuildsycoca6 --noincremental >/dev/null 2>&1 || true
-command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" >/dev/null 2>&1 || true
 
 say "theme bundle (BlackViolet, from Noctalia palette)"
 THEME_DIR="$HOME/.config/zeron-themes"
