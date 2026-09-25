@@ -22,7 +22,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.102"
+version = "0.2.102-mael.3"
 edition = "2024"
 license = "MIT"
 publish = false
