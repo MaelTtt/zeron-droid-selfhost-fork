@@ -117,6 +117,9 @@ ls -1d "$HOME/.zeron/app/fork-"[0-9]* 2>/dev/null \
 export PATH="$HOME/.local/bin:$PATH"
 mkdir -p "$HOME/.local/bin"
 ln -sf "$HOME/.zeron/app/current/zeron" "$HOME/.local/bin/zeron"
+# fork update helper (rebase onto official releases + rebuild)
+cp "$CLONE_DIR/scripts/zeron-fork-update.sh" "$HOME/.local/bin/zeron-fork-update"
+chmod +x "$HOME/.local/bin/zeron-fork-update"
 
 say "theme bundle (BlackViolet, from Noctalia palette)"
 THEME_DIR="$HOME/.config/zeron-themes"

@@ -35,7 +35,7 @@ It does, in this order:
 2. **Rust** — installs stable via rustup if `cargo` isn't on PATH.
 3. **Clone/pull** the fork to `~/.build/zeron` (branch `mael/main`).
 4. **Build** — `cargo build --release -p zeron` (10–20 min).
-5. **Install** the binary at `~/.zeron/app/local-mael/zeron` with a `.mael-fork` marker; `~/.zeron/app/current` → that dir (same layout as the other devices); `~/.local/bin/zeron` symlink for PATH.
+5. **Install** the binary at `~/.zeron/app/fork-<version>/zeron` with a `.mael-fork` marker; `~/.zeron/app/current` → that dir; `~/.local/bin/zeron` symlink for PATH; `~/.local/bin/zeron-fork-update` helper for taking future official releases.
 6. **Desktop entry + icon** — `~/.local/share/applications/zeron.desktop` with **absolute** `Exec` (krunner has no `~/.local/bin` in PATH — this is why "type `zeron` in the launcher" failed before), `StartupWMClass=zeron`, icon in hicolor, caches refreshed (update-desktop-database + kbuildsycoca6 + gtk-update-icon-cache).
 7. **Env** — `~/.zeron/env` gets:
    ```
@@ -78,13 +78,7 @@ It's a *linked* theme: because it points at the copied repo bundle, a future
 ## Updating later
 
 - On the fork's home PC: `zeron-fork-update` rebases the fork onto the next official release and rebuilds.
-- On other machines it's a plain git pull + rebuild:
-  ```bash
-  cd ~/.build/zeron && git pull --ff-only origin mael/main
-  cargo build --release -p zeron
-  cp target/release/zeron ~/.zeron/app/local-mael/zeron
-  systemctl --user restart zeron
-  ```
+- On other machines, re-run `./scripts/install-desktop.sh` (it pulls `mael/main`, rebuilds only if the build changed, and swaps the binary).
 - Never run stock `zeron update` while the fork is installed — the fork's guard refuses with a pointer to `zeron-fork-update` (see FORK.md).
 
 ## Troubleshooting
