@@ -832,6 +832,7 @@ fn full_registry() -> HarnessRegistry {
                 ReasoningLevel::Max,
             ],
             installed: true,
+            can_install: false,
             enabled: None,
         },
         Box::new(|| zeron_harness::AcpHarness::droid().installed()),

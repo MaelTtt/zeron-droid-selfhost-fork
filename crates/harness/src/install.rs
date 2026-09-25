@@ -106,6 +106,13 @@ fn methods(id: HarnessId, platform: Platform) -> Vec<Method> {
             "curl -fsSL https://cli.devin.ai/install.sh | bash",
             "bash",
         )],
+        Droid if windows => vec![PowerShell(
+            "irm https://app.factory.ai/cli.ps1 | iex",
+        )],
+        Droid => vec![Shell(
+            "curl -fsSL https://app.factory.ai/cli | sh",
+            "sh",
+        )],
     }
 }
 
@@ -161,6 +168,7 @@ pub fn manual_command(id: HarnessId) -> Option<&'static str> {
         Hermes => "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash",
         Devin => "curl -fsSL https://cli.devin.ai/install.sh | bash",
         Muse => "curl -fsSL https://dev.meta.ai/install.sh | sh",
+        Droid => "curl -fsSL https://app.factory.ai/cli | sh",
         Antigravity | Mock => return None,
     })
 }
@@ -176,6 +184,7 @@ fn cli_and_dir(id: HarnessId) -> (&'static str, &'static str) {
         Grok => ("grok", "~/.grok/bin or the npm global bin"),
         Hermes => ("hermes", "~/.local/bin or ~/.hermes/bin"),
         Devin => ("devin", "~/.local/bin"),
+        Droid => ("droid", "~/.local/bin or ~/.factory/bin"),
         Antigravity => ("agy_acp_server", "~/.zeron/adapters"),
         Muse => ("muse", "~/.local/bin"),
         Mock => ("mock", "PATH"),
@@ -193,6 +202,7 @@ pub fn installed(id: HarnessId) -> bool {
         Grok => crate::AcpHarness::grok().installed(),
         Hermes => crate::AcpHarness::hermes().installed(),
         Devin => crate::AcpHarness::devin().installed(),
+        Droid => crate::AcpHarness::droid().installed(),
         Antigravity => crate::AcpHarness::antigravity().installed(),
         Muse => crate::MuseHarness::new().installed(),
         Mock => false,
