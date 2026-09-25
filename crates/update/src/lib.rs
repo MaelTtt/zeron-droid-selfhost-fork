@@ -119,14 +119,23 @@ pub fn mac_app_artifact(version: &str) -> String {
     format!("zeron-{version}-macos-{arch}-app.tar.gz")
 }
 
-/// Strictly-newer dotted-numeric compare (`0.1.10` > `0.1.9` > `0.1`).
-/// Unparseable versions never count as newer — a garbage `latest.txt` must not
-/// trigger an update loop.
+/// Strictly-newer dotted-numeric compare (`0.1.10` > `0.1.9` > `0.1.1`).
+/// A `-suffix`/`+suffix` (e.g. the mael fork's `-mael.1`) is stripped before
+/// comparing, so `0.2.91` counts as newer than `0.2.86-mael.1` — while equal
+/// numeric cores never count as newer either way, so a fork at the same base
+/// as the official release is not nagged into "updating" to stock and losing
+/// its patches. Unparseable versions never count as newer — a garbage
+/// `latest.txt` must not trigger an update loop.
 pub fn version_newer(latest: &str, current: &str) -> bool {
+    fn core(v: &str) -> &str {
+        let v = v.trim().trim_start_matches('v');
+        match v.find(['-', '+']) {
+            Some(i) => &v[..i],
+            None => v,
+        }
+    }
     fn parts(v: &str) -> Option<Vec<u64>> {
-        let nums: Vec<u64> = v
-            .trim()
-            .trim_start_matches('v')
+        let nums: Vec<u64> = core(v)
             .split('.')
             .map(|p| p.parse().ok())
             .collect::<Option<_>>()?;
@@ -1160,6 +1169,11 @@ mod tests {
         // Garbage never counts as newer.
         assert!(!version_newer("", "0.1.0"));
         assert!(!version_newer("nightly", "0.1.0"));
+        // Fork suffixes compare on their numeric core; equal cores are never
+        // "newer" (a fork at the same base must not be nagged toward stock).
+        assert!(version_newer("0.2.91", "0.2.86-mael.1"));
+        assert!(!version_newer("0.2.91", "0.2.91-mael.1"));
+        assert!(!version_newer("0.2.91-mael.1", "0.2.91"));
     }
 
     #[test]

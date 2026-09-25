@@ -22,10 +22,11 @@ When upstream #372 merges, the rebase will naturally drop what upstream already 
 
 - Fork version = `<upstream version>-mael.<n>` (currently `0.2.86-mael.1`), tag
   `mael/v<version>` on `mael/main`.
-- The `-mael.1` suffix is unparseable by upstream's `version_newer` dotted-numeric compare,
-  so official releases never silently auto-apply over the fork, and `zeron update --check`
-  never treats same-version releases as a downgrade. It still prints "X available" when
-  upstream moves ahead.
+- The `-mael.1` suffix is stripped before the numeric compare in `version_newer`,
+  so `zeron update --check` correctly reports a newer official release as
+  available — and, with `ZERON_FORK` set, points at `zeron-fork-update` instead
+  of overwriting the fork. Equal numeric cores never count as newer, so a fork
+  already at the same base is never nagged into "updating" to stock.
 - `zeron status` prints `Fork: mael (<version> + droid + selfhost)` when `ZERON_FORK` is set
   (set in `~/.zeron/env`, which the systemd unit loads).
 
@@ -57,12 +58,17 @@ compiles).
 
 ## Install layout
 
-- Fork binary: `~/.zeron/app/local-mael/zeron`, with a `.mael-fork` marker file.
-- `~/.zeron/app/current` → `~/.zeron/app/local-mael` — the systemd `zeron.service` runs from
-  `current`, so the engine daemon and the desktop UI share the fork.
+- Fork binary: `~/.zeron/app/fork-<version>/zeron` (one dir per build), with a
+  `.mael-fork` marker file. Older fork dirs are pruned (newest 2 kept).
+- `~/.zeron/app/current` → the active `fork-<version>` dir — the systemd
+  `zeron.service` runs from `current`, so the engine daemon and the desktop UI
+  share the fork.
 - `~/.local/bin/zeron` → `~/.zeron/app/current/zeron`, so `zeron` on PATH is the fork.
-- The official 0.2.86 release stays in `~/.zeron/app/0.2.86/` — removeable if you ever leave
-  the fork; running stock `zeron update` afterwards takes you back to official releases.
+- `~/.local/bin/zeron-fork-update` — the helper that takes official releases
+  (installed by `scripts/install-desktop.sh`).
+- The official release dir (e.g. `~/.zeron/app/0.2.86/`) stays untouched if one
+  was installed before the fork; running stock `zeron update` afterwards takes
+  you back to official releases.
 
 ## Gotchas
 
