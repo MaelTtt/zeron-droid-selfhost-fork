@@ -709,6 +709,10 @@ impl UpdateStatus {
 
 /// `ZERON_AUTO_UPDATE=1|true|yes` — headless daemons apply updates themselves.
 fn auto_update_enabled() -> bool {
+    if std::env::var("ZERON_FORK").is_ok_and(|v| !v.trim().is_empty()) {
+        tracing::info!("update swapped out by the fork guard");
+        return false;
+    }
     std::env::var("ZERON_AUTO_UPDATE")
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false)

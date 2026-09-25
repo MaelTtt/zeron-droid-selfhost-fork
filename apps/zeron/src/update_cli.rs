@@ -9,6 +9,7 @@ use zeron_update::{InstallKind, current_version, version_newer};
 /// `--check` prints the verdict and exits (nonzero when an update is available,
 /// so scripts can gate on it).
 pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
+    let fork = std::env::var("ZERON_FORK").is_ok_and(|v| !v.trim().is_empty());
     let manifest = zeron_update::fetch_latest(edge_url).await?;
     let current = current_version();
     if !version_newer(&manifest.version, current) {
@@ -20,7 +21,20 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
     }
     println!("zeron {current} → {} available", manifest.version);
     if check_only {
+        if fork {
+            println!(
+                "note: forked build ({current}) — official {} won't overwrite it. To take the release with fork patches, run `zeron-fork-update`.",
+                manifest.version
+            );
+        }
         std::process::exit(1);
+    }
+    if fork {
+        bail!(
+            "this is the mael fork ({current}); `zeron update` would overwrite it with stock {}.\nTo take the official release while keeping the fork patches, run `zeron-fork-update` instead — it rebases onto {} and rebuilds.",
+            manifest.version,
+            manifest.version
+        );
     }
 
     match zeron_update::detect_install() {
