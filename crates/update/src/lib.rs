@@ -146,9 +146,17 @@ pub fn mac_app_artifact(version: &str) -> String {
 }
 
 fn parse_version(v: &str) -> Option<Vec<u64>> {
-    let nums: Vec<u64> = v
-        .trim()
-        .trim_start_matches('v')
+    // A `-suffix`/`+suffix` (e.g. the mael fork's `-mael.3`) is stripped
+    // before comparing, so `0.2.102` counts as newer than `0.2.96-mael.2` —
+    // while equal numeric cores never count as newer either way, so a fork
+    // at the same base as the official release is not nagged into
+    // "updating" to stock and losing its patches.
+    let core = v.trim().trim_start_matches('v');
+    let core = match core.find(['-', '+']) {
+        Some(i) => &core[..i],
+        None => core,
+    };
+    let nums: Vec<u64> = core
         .split('.')
         .map(|p| p.parse().ok())
         .collect::<Option<_>>()?;
@@ -1622,6 +1630,11 @@ mod tests {
         // Garbage never counts as newer.
         assert!(!version_newer("", "0.1.0"));
         assert!(!version_newer("nightly", "0.1.0"));
+        // Fork suffixes compare on their numeric core; equal cores are never
+        // "newer" (a fork at the same base must not be nagged toward stock).
+        assert!(version_newer("0.2.91", "0.2.86-mael.1"));
+        assert!(!version_newer("0.2.91", "0.2.91-mael.1"));
+        assert!(!version_newer("0.2.91-mael.1", "0.2.91"));
     }
 
     #[test]
