@@ -46,7 +46,7 @@ It does, in this order:
 8. **Engine daemon** — `zeron daemon install` (systemd `--user` service; skip with `SKIP_DAEMON=1`).
 9. Prints `zeron status` — should show:
    ```
-   Fork:     mael (0.2.86-mael.1 + droid + selfhost)
+   Fork:     mael (0.2.91-mael.1 + droid + selfhost)
    Edge:     http://10.66.0.1:8787
    Mode:     development
    Auth:     dev mode (bearer = user id)

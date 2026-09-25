@@ -11,7 +11,7 @@ releases.
 | 9c1673d6 | **Factory Droid as a first-class ACP harness** — `droid exec --output-format acp`, live model discovery, autonomy wiring | upstream PR #372 (rebased) |
 | 30df737d | Droid permission level persistence in the model picker | upstream PR #372 |
 | 8014e64d | **Self-host the edge with `AUTH_MODE=none`** — Docker edge relay (`docker-compose.selfhost.yml`, `edge/Dockerfile`, `edge/wrangler.selfhost.jsonc`, `docs/SELFHOST.md`); the engine accepts your own `ZERON_EDGE_URL` with no WorkOS/Zeron account | upstream PR #317 |
-| ba470911 | **Fork identity** — version `0.2.86-mael.1`; `zeron update` refuses to overwrite the fork while `ZERON_FORK` is set (points at `zeron-fork-update`); background auto-update disabled; `zeron status` shows the fork line | mael |
+| ba470911 | **Fork identity** — version `0.2.91-mael.1`; `zeron update` refuses to overwrite the fork while `ZERON_FORK` is set (points at `zeron-fork-update`); background auto-update disabled; `zeron status` shows the fork line | mael |
 | 0502fe67 | 0.2.86 surface adaptation of the droid harness (install methods, skills dirs, spec fields, registry descriptor, auth test API) | mael |
 
 Skipped on purpose: the PR's "Permission trait to every harness" commit (`ae4d39d1`) —
@@ -20,7 +20,7 @@ When upstream #372 merges, the rebase will naturally drop what upstream already 
 
 ## Versioning
 
-- Fork version = `<upstream version>-mael.<n>` (currently `0.2.86-mael.1`), tag
+- Fork version = `<upstream version>-mael.<n>` (currently `0.2.91-mael.1`), tag
   `mael/v<version>` on `mael/main`.
 - The `-mael.1` suffix is stripped before the numeric compare in `version_newer`,
   so `zeron update --check` correctly reports a newer official release as
@@ -72,8 +72,8 @@ compiles).
 
 ## Gotchas
 
-- The fork's engine *code* is upstream 0.2.86 + the patches; the version string is only a
-  display identity. Wire-protocol sync with official devices is unchanged (same 0.2.86 code).
+- The fork's engine *code* is upstream 0.2.91 + the patches; the version string is only a
+  display identity. Wire-protocol sync with official devices is unchanged (same 0.2.91 code).
 - Never run stock `zeron update` while the fork is installed: the fork's own guard refuses the
   self-overwrite, but if an official binary ever got swapped in externally, `zeron-fork-update`
   restores the fork cleanly.
