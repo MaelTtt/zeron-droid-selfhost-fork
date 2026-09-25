@@ -1,0 +1,20 @@
+{
+	"name": "black-violet",
+	"displayName": "Black Violet (Noctalia)",
+	"publisher": "mael",
+	"version": "1.0.0",
+	"contributes": {
+		"themes": [
+			{
+				"label": "Black Violet Dark",
+				"path": "./black-violet.dark.json",
+				"uiTheme": "vs-dark"
+			},
+			{
+				"label": "Black Violet Light",
+				"path": "./black-violet.light.json",
+				"uiTheme": "vs"
+			}
+		]
+	}
+}
