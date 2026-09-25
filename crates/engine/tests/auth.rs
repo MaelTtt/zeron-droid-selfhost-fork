@@ -865,7 +865,7 @@ async fn detect_probes_edge_none_mode_adopts_identity() {
     config.dev_user_id = "someone@else".into();
     let auth = Auth::detect(config).await;
     assert!(!auth.workos_enabled(), "open edge skips WorkOS");
-    assert_eq!(auth.access_token().await.as_deref(), Some("home@lab"));
+    assert_eq!(auth.access_token().await.as_deref(), Ok("home@lab"));
     assert_eq!(auth.user_id().as_deref(), Some("home"));
     assert_eq!(auth.dev_org_id().as_deref(), Some("lab"));
     assert!(auth.open_edge(), "an open edge is one we sync against");
