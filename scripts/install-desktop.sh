@@ -62,6 +62,9 @@ say "build (release; grab a coffee, ~10-20 min)"
 cargo build --release -p zeron
 
 say "install binary as the fork app"
+# the running engine holds the binary (ETXTBSY) — stop it for the swap
+systemctl --user stop zeron.service 2>/dev/null || pkill -x zeron 2>/dev/null || true
+sleep 1
 mkdir -p "$HOME/.zeron/app/local-mael"
 cp target/release/zeron "$HOME/.zeron/app/local-mael/zeron"
 echo "mael fork — rebuild via zeron-fork-update or re-clone" \
@@ -124,6 +127,9 @@ if [ "${SKIP_DAEMON:-0}" != "1" ]; then
     say "engine daemon (systemd --user)"
     "$HOME/.local/bin/zeron" daemon install
 fi
+
+say "restarting engine"
+systemctl --user restart zeron.service 2>/dev/null || true
 
 say "done"
 "$HOME/.local/bin/zeron" status
