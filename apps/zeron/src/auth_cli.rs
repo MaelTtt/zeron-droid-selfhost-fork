@@ -166,6 +166,9 @@ pub async fn status(config: EngineConfig) -> anyhow::Result<()> {
         .unwrap_or(next_scope);
     let account = account_status(scope, &auth.state());
     println!("Data dir: {}", config.data_dir.display());
+    if std::env::var("ZERON_FORK").is_ok_and(|v| !v.trim().is_empty()) {
+        println!("Fork:     mael ({} + droid + selfhost)", env!("CARGO_PKG_VERSION"));
+    }
     println!("Edge:     {}", config.edge_url);
     println!("Mode:     {}", account.mode);
     println!("Auth:     {}", account.auth);
