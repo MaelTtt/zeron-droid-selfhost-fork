@@ -421,6 +421,7 @@ fn droid_spec() -> AcpAgentSpec {
         // not these flags.
         args: &["exec", "--output-format", "acp"],
         npm_package: None,
+        archive: None,
         extra_paths: droid_install_paths,
         cli_executable: "droid",
         cli_extra_paths: droid_install_paths,
@@ -472,6 +473,8 @@ fn droid_spec() -> AcpAgentSpec {
             ]
         },
         // No `_session/steering` extension: steers deliver at turn boundaries.
+        effort_in_model_id: false,
+        auth_method: None,
         steering_mode: SteeringMode::TurnBoundary,
         // reasoning_effort is advertised as thought_level (none/low/medium/
         // high/xhigh/max). "none" has no zeron tier and stays the agent default.
@@ -485,6 +488,8 @@ fn droid_spec() -> AcpAgentSpec {
         prompt_transform: identity_transform,
         effort_values: default_effort_values,
         ladder_extras: &[],
+        skill_dirs: Vec::new,
+        hidden_commands: &[],
         prompt_complete_extension: false,
         prompt_stall: None,
         stall_hint: "The agent process is likely wedged.",
