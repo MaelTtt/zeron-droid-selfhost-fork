@@ -776,6 +776,8 @@ pub struct AppState {
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
+    /// Latest `UpdateStatus` frame — drives the sidebar update strip.
+    pub update: Option<zeron_update::UpdateStatus>,
     /// Device-local agent CLI update lifecycle. Unlike `ListHarnesses`, this
     /// standing stream may be backed by subprocess and network probes.
     pub harness_updates: Vec<zeron_proto::HarnessUpdateStatus>,
@@ -1381,6 +1383,10 @@ impl AppState {
 
     pub fn apply_harness_updates(&mut self, statuses: Vec<zeron_proto::HarnessUpdateStatus>) {
         self.harness_updates = statuses;
+    }
+
+    pub fn apply_update(&mut self, status: zeron_update::UpdateStatus) {
+        self.update = Some(status);
     }
 
     pub fn apply_auth(&mut self, auth: AuthState) {
@@ -2278,6 +2284,15 @@ impl AppState {
                 state.apply_auth_value(value);
                 true
             }),
+            spawn_watch(
+                cx,
+                handle.clone(),
+                methods::UPDATE_STATUS,
+                |state, value| {
+                    state.apply_update(value);
+                    true
+                },
+            ),
             spawn_local_device_probe(cx, handle.clone()),
         ]);
         if supports_harness_updates {

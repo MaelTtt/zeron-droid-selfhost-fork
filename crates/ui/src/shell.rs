@@ -1443,8 +1443,16 @@ struct ChatRename {
     reveal_until: Option<std::time::Instant>,
     _events: Subscription,
     /// Commit-on-blur, armed once the input has taken focus.
-    _blur: Option<Subscription>,
-}
+    _blur: Option<Subscription>,/// In-app update lifecycle (macOS bundle installs; see `render_update_strip`).
+enum UpdateFlow {
+    Idle,
+    Downloading,
+    /// Staged bundle ready to swap in — one click restarts into it.
+    Ready(PathBuf),
+    /// Managed (headless) apply in flight — the `ApplyUpdate` RPC stages,
+    /// swaps, and restarts the engine service; the strip waits on it.
+    Applying,
+    Failed(SharedString),}
 
 /// Account lifecycle owned by this process. Sign-in on a local workspace
 /// flows through the in-place switch wizard (offer → switch → import → done);
@@ -2036,11 +2044,20 @@ pub struct Shell {
     user_menu: popover::Popup<()>,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
-    /// Repaints the update strip and dialog as the app-level update
-    /// lifecycle ([`crate::app_update`]) moves. `None` when the app runs
-    /// without a desktop checker (tests).
-    _app_update_observation: Option<Subscription>,
-    org: Option<OrgGateUi>,
+    /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
+    /// UpdateStatus stream says WHETHER one exists; this says how far the
+    /// download/stage of it has come in this process.
+    update_flow: UpdateFlow,
+    update_task: Option<Task<()>>,
+    /// Version whose update strip the user dismissed (advisory installs only —
+    /// a newer release shows the strip again).
+    update_dismissed: Option<String>,
+    /// How this binary was installed — decides the strip's click behavior.
+    /// Cached: `detect_install` stats `current_exe` and this renders per frame.
+    install: zeron_update::InstallKind,
+    /// mael-fork build (`.mael-fork` marker / `ZERON_FORK`) — the strip may
+    /// detect a newer release, but applying stock would clobber the fork.
+    fork: bool,    org: Option<OrgGateUi>,
     sync_flow: SyncFlow,
     mutate_task: Option<Task<()>>,
     auth_task: Option<Task<()>>,
@@ -2468,9 +2485,11 @@ impl Shell {
             harness_update_scroll: settings::widgets::PageScroll::default(),
             user_menu: popover::Popup::default(),
             sidebar_notice: None,
-            _app_update_observation: crate::app_update::AppUpdate::global(cx)
-                .map(|update| cx.observe(&update, |_, _, cx| cx.notify())),
-            org: None,
+            update_flow: UpdateFlow::Idle,
+            update_task: None,
+            update_dismissed: None,
+            install: zeron_update::detect_install(),
+            fork: zeron_update::is_fork_install(),            org: None,
             sync_flow: SyncFlow::Idle,
             mutate_task: None,
             auth_task: None,
@@ -8576,13 +8595,17 @@ impl Shell {
     /// can't replace themselves explain why; advisory installs point at
     /// `zeron update` or the GitHub releases page and dismiss per version.
     fn render_update_strip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let update = crate::app_update::AppUpdate::global(cx)?;
-        let (label, action) = update.read(cx).strip()?;
-        let failed = matches!(
-            update.read(cx).flow(),
-            crate::app_update::Flow::Failed { .. }
-        );
-        let tone = if failed { theme.danger } else { theme.accent };
+        let status = self.state.read(cx).update.clone()?;
+        if !status.update_available {
+            return None;
+        }
+        let latest = status.latest_version.clone()?;
+        if self.update_dismissed.as_deref() == Some(latest.as_str()) {
+            return None;
+        }
+        let (label, clickable) =
+            Self::update_strip_label(&self.install, &self.update_flow, &latest, self.fork);
+        let failed = matches!(self.update_flow, UpdateFlow::Failed(_));        let tone = if failed { theme.danger } else { theme.accent };
         // Follow the selected spectrum with a low-emphasis glass tint rather
         // than painting the bright text accent as a solid slab.
         let (chip_bg, chip_bg_hover) = if failed {
@@ -8607,45 +8630,165 @@ impl Shell {
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(tone)
             .child(div().flex_1().min_w_0().child(label));
-        if action != crate::app_update::StripAction::None {
-            strip = strip
-                .cursor_pointer()
-                .hover(move |s| s.bg(chip_bg_hover))
-                .on_click(
-                    cx.listener(move |this, _, _, cx| this.on_update_strip_click(action, cx)),
-                );
+        if clickable {
+            strip = strip.cursor_pointer().hover(move |s| s.bg(chip_bg_hover)).on_click(
+                cx.listener(move |this, _, _, cx| this.on_update_strip_click(cx)),
+            );
         }
         Some(strip.into_any_element())
     }
 
-    /// Download → the background stage; Restart → swap + relaunch; Explain →
-    /// the update dialog; advisory installs open their destination (if any),
-    /// then dismiss for this version.
-    fn on_update_strip_click(
-        &mut self,
-        action: crate::app_update::StripAction,
-        cx: &mut Context<Self>,
-    ) {
-        use crate::app_update::{AppUpdate, StripAction};
-        let Some(update) = AppUpdate::global(cx) else {
-            return;
-        };
-        match action {
-            StripAction::None => {}
-            StripAction::Download => update.update(cx, |update, cx| update.start_download(cx)),
-            StripAction::Restart => {
-                if let Some(staged) = update.read(cx).staged() {
-                    self.apply_staged_update(staged, cx);
+    /// The update strip's label and click affordance per install kind. Desktop
+    /// update installs (macOS bundles, Windows portable packages) drive their
+    /// flow from the strip; managed installs apply the headless release from
+    /// the strip too (`ApplyUpdate`: stage + swap + service restart) — except
+    /// a fork build, which a stock release would overwrite, so it only points
+    /// at `zeron-fork-update`; unmanaged installs (source builds,
+    /// hand-copied binaries) are pointed at the GitHub releases page.
+    fn update_strip_label(
+        install: &zeron_update::InstallKind,
+        flow: &UpdateFlow,
+        latest: &str,
+        fork: bool,
+    ) -> (SharedString, bool) {
+        if install.supports_desktop_update() {
+            match flow {
+                UpdateFlow::Idle => (format!("Update available — v{latest}").into(), true),
+                UpdateFlow::Downloading => (format!("Downloading v{latest}…").into(), false),
+                UpdateFlow::Applying => (format!("Updating to v{latest}…").into(), false),
+                UpdateFlow::Ready(_) => ("Update ready — restart to apply".into(), true),
+                UpdateFlow::Failed(message) => (format!("Update failed: {message}").into(), true),
+            }
+        } else if matches!(install, zeron_update::InstallKind::Managed { .. }) {
+            if fork {
+                (
+                    format!("Update available — v{latest} · run `zeron-fork-update`").into(),
+                    true,
+                )
+            } else {
+                match flow {
+                    UpdateFlow::Applying => (format!("Updating to v{latest}…").into(), false),
+                    UpdateFlow::Failed(message) => {
+                        (format!("Update failed: {message}").into(), true)
+                    }
+                    _ => (
+                        format!("Update available — v{latest} · click to update").into(),
+                        true,
+                    ),
                 }
             }
-            StripAction::Explain => update.update(cx, |update, cx| update.show_result(cx)),
-            StripAction::Advise { open_releases } => {
-                if open_releases {
-                    cx.open_url(zeron_update::RELEASES_PAGE);
-                }
-                update.update(cx, |update, cx| update.dismiss_advisory(cx));
-            }
+        } else {
+            (
+                format!("Update available — v{latest} · download from GitHub").into(),
+                true,
+            )
         }
+    }
+
+    /// Idle → download; Ready → swap + relaunch; Failed → retry; managed
+    /// installs → the engine's `ApplyUpdate` (stages the headless release,
+    /// swaps it, restarts the service); advisory installs (a fork build:
+    /// `zeron-fork-update`, unmanaged: the GitHub releases page) → open the
+    /// destination if there is one, then dismiss for this version.
+    fn on_update_strip_click(&mut self, cx: &mut Context<Self>) {
+        // Managed stock installs: the engine updates itself in place. The
+        // strip waits on the RPC (stage + swap + service restart — the reply
+        // flushes before systemd kills the process), then hides: the fresh
+        // engine reports up to date when it rejoins.
+        if matches!(self.install, zeron_update::InstallKind::Managed { .. }) && !self.fork {
+            if matches!(self.update_flow, UpdateFlow::Applying) {
+                return;
+            }
+            let Some(engine) = self.state.read(cx).engine().cloned() else {
+                self.update_flow = UpdateFlow::Failed("Engine not connected".into());
+                cx.notify();
+                return;
+            };
+            self.update_flow = UpdateFlow::Applying;
+            let apply = Tokio::spawn(cx, async move {
+                engine
+                    .client()
+                    .call(methods::APPLY_UPDATE, serde_json::json!({}))
+                    .await
+            });
+            self.update_task = Some(cx.spawn(async move |this, cx| {
+                let outcome = match apply.await {
+                    Ok(Ok(reply)) => Ok(reply
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)),
+                    Ok(Err(err)) => Err(format!("{err:#}")),
+                    Err(join_err) => Err(join_err.to_string()),
+                };
+                this.update(cx, |shell, cx| {
+                    shell.update_flow = match outcome {
+                        Ok(version) => {
+                            // Hide the strip until the restarted engine's
+                            // first status frame re-evaluates availability.
+                            shell.update_dismissed = version;
+                            UpdateFlow::Idle
+                        }
+                        Err(message) => UpdateFlow::Failed(message.into()),
+                    };
+                    cx.notify();
+                })
+                .ok();
+            }));
+            cx.notify();
+            return;
+        }
+        if !self.install.supports_desktop_update() {
+            if matches!(self.install, zeron_update::InstallKind::Unmanaged) {
+                cx.open_url(zeron_update::RELEASES_PAGE);
+            }
+            self.update_dismissed = self
+                .state
+                .read(cx)
+                .update
+                .as_ref()
+                .and_then(|s| s.latest_version.clone());
+            cx.notify();
+            return;
+        }
+        match std::mem::replace(&mut self.update_flow, UpdateFlow::Idle) {
+            UpdateFlow::Idle | UpdateFlow::Failed(_) => self.begin_update_download(cx),
+            UpdateFlow::Downloading | UpdateFlow::Applying => {
+                self.update_flow = UpdateFlow::Downloading;
+            }
+            UpdateFlow::Ready(staged) => self.apply_staged_update(staged, cx),
+        }
+    }
+
+    /// Fetch the manifest and stage the new Zeron desktop bundle under the data dir
+    /// (tokio — reqwest); the strip flips to "restart to apply" when done.
+    fn begin_update_download(&mut self, cx: &mut Context<Self>) {
+        let edge_url = self.boot.edge_url.clone();
+        let data_dir = self.data_dir.clone();
+        let install = self.install.clone();
+        self.update_flow = UpdateFlow::Downloading;
+        let download = Tokio::spawn(cx, async move {
+            let manifest = zeron_update::fetch_latest(&edge_url).await?;
+            install.stage_desktop(&edge_url, &manifest, &data_dir).await
+        });
+        self.update_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = match download.await {
+                Ok(Ok(staged)) => Ok(staged),
+                Ok(Err(err)) => Err(format!("{err:#}")),
+                Err(join_err) => Err(join_err.to_string()),
+            };
+            this.update(cx, |shell, cx| {
+                shell.update_flow = match outcome {
+                    Ok(staged) => UpdateFlow::Ready(staged),
+                    Err(message) => {
+                        tracing::warn!(%message, "update download failed");
+                        UpdateFlow::Failed(message.into())
+                    }
+                };
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
     /// Swap the staged update over the installed one, arm the detached
@@ -13541,6 +13684,78 @@ mod tests {
         assert_eq!(chat_sync_pill_caption(&chat), Some("Sync queued — changes are saved"));
         chat.sync_state = S::Connecting;
         assert_eq!(chat_sync_pill_caption(&chat), Some("Syncing…"));
+    }
+
+    #[test]
+    fn update_strip_labels_cover_every_install_kind() {
+        // Managed (curl|sh daemon layout), stock: one click applies the
+        // headless release (stage + swap + service restart).
+        let managed = zeron_update::InstallKind::Managed {
+            app_root: PathBuf::from("/home/u/.zeron/app"),
+        };
+        let stock = Shell::update_strip_label(&managed, &UpdateFlow::Idle, "0.2.86", false);
+        assert_eq!(
+            stock.0,
+            SharedString::from("Update available — v0.2.86 · click to update")
+        );
+        assert!(stock.1);
+        assert_eq!(
+            Shell::update_strip_label(&managed, &UpdateFlow::Applying, "0.2.86", false).0,
+            SharedString::from("Updating to v0.2.86…")
+        );
+        assert!(
+            !Shell::update_strip_label(&managed, &UpdateFlow::Applying, "0.2.86", false).1
+        );
+        // Managed, fork build: applying stock would clobber the fork — the
+        // strip points at the fork's own updater instead.
+        let fork = Shell::update_strip_label(&managed, &UpdateFlow::Idle, "0.2.86", true);
+        assert_eq!(
+            fork.0,
+            SharedString::from("Update available — v0.2.86 · run `zeron-fork-update`")
+        );
+        assert!(fork.1);
+        // Unmanaged (source builds, hand-copied binaries — bare Windows
+        // release exes): the GitHub releases page, clickable to open it.
+        let unmanaged = Shell::update_strip_label(
+            &zeron_update::InstallKind::Unmanaged,
+            &UpdateFlow::Idle,
+            "0.2.86",
+            false,
+        );
+        assert_eq!(
+            unmanaged.0,
+            SharedString::from("Update available — v0.2.86 · download from GitHub")
+        );
+        assert!(unmanaged.1);
+        // Downloading is not clickable (desktop flow) and the flow labels stay
+        // untouched for the installs that own them.
+        let mac_app = zeron_update::InstallKind::MacApp {
+            bundle: PathBuf::from("/Applications/Zeron.app"),
+        };
+        assert_eq!(
+            Shell::update_strip_label(&mac_app, &UpdateFlow::Downloading, "0.2.86", false).0,
+            SharedString::from("Downloading v0.2.86…")
+        );
+        assert!(
+            !Shell::update_strip_label(&mac_app, &UpdateFlow::Downloading, "0.2.86", false).1
+        );
+        assert_eq!(
+            Shell::update_strip_label(&mac_app, &UpdateFlow::Idle, "0.2.86", false).0,
+            SharedString::from("Update available — v0.2.86")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_portable_strip_drives_the_desktop_flow() {
+        let portable = zeron_update::InstallKind::WindowsPortable {
+            directory: PathBuf::from(r"C:\Users\u\AppData\Local\Programs\Zeron"),
+        };
+        assert_eq!(
+            Shell::update_strip_label(&portable, &UpdateFlow::Idle, "0.2.86", false).0,
+            SharedString::from("Update available — v0.2.86")
+        );
+        assert!(Shell::update_strip_label(&portable, &UpdateFlow::Idle, "0.2.86", false).1);
     }
 
     #[test]

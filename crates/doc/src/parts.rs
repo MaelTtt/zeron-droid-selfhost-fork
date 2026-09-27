@@ -204,6 +204,15 @@ pub enum MessagePart {
         id: String,
         message: String,
     },
+    /// A neutral informational chip (a mid-session model switch — Droid's
+    /// quota fallback to its core models is the motivating case). Amber
+    /// attention treatment, not failure. Old desktop builds' unknown-kind
+    /// fallback yields an empty text part (invisible); iOS drops unknown
+    /// kinds.
+    Notice {
+        id: String,
+        message: String,
+    },
     /// The seam in a forked chat's transcript: everything above was copied
     /// from `source_chat_id` when the fork was cut, everything below is this
     /// chat's own. Written once by the fork RPC; renders as a labeled
@@ -229,6 +238,7 @@ impl MessagePart {
             | MessagePart::Tool { id, .. }
             | MessagePart::Input { id, .. }
             | MessagePart::Error { id, .. }
+            | MessagePart::Notice { id, .. }
             | MessagePart::Fork { id, .. } => id,
         }
     }
@@ -262,6 +272,7 @@ impl MessagePart {
                 mime_type,
             } => id.len() + path.len() + name.len() + mime_type.len(),
             MessagePart::Error { message, .. } => message.len(),
+            MessagePart::Notice { message, .. } => message.len(),
             MessagePart::Fork {
                 source_chat_id,
                 source_title,
@@ -429,6 +440,14 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 id,
                 message: message.clone(),
             });
+        }
+        AgentEvent::ModelSwitched { from, to } => {
+            let message = match from {
+                Some(from) => format!("Model switched from {from} to {to}"),
+                None => format!("Model switched to {to}"),
+            };
+            let id = format!("n{}", out.len());
+            out.push(MessagePart::Notice { id, message });
         }
         AgentEvent::Done { error, .. } => {
             if let Some(message) = error {
@@ -744,6 +763,40 @@ mod tests {
             &parts[2],
             MessagePart::Reasoning { id, text } if id == "r2" && text == "more"
         ));
+    }
+
+    #[test]
+    fn model_switch_folds_to_notice_chip() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(&mut parts, &text_delta("working"));
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ModelSwitched {
+                from: Some("claude-sonnet".into()),
+                to: "droid-core-v1.5".into(),
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ModelSwitched {
+                from: None,
+                to: "auto".into(),
+            },
+        );
+        assert_eq!(parts.len(), 3);
+        assert_eq!(
+            parts[1],
+            MessagePart::Notice {
+                id: "n1".into(),
+                message: "Model switched from claude-sonnet to droid-core-v1.5".into(),
+            }
+        );
+        match &parts[2] {
+            MessagePart::Notice { message, .. } => {
+                assert_eq!(message, "Model switched to auto")
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]
