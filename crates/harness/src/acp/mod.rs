@@ -489,6 +489,7 @@ fn droid_spec() -> AcpAgentSpec {
         ladder_extras: &[],
         skill_dirs: Vec::new,
         hidden_commands: &[],
+        drops_unstarted_cancelled_prompt: false,
         prompt_complete_extension: false,
         prompt_stall: None,
         stall_hint: "The agent process is likely wedged.",

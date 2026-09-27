@@ -258,6 +258,12 @@ fn provider(id: HarnessId) -> ProviderSpec {
             update_args: Some(&["upgrade"]),
             manual_command: "opencode upgrade",
         },
+        HarnessId::Droid => ProviderSpec {
+            version_args: &["--version"],
+            latest: LatestSource::Command(&["update", "--check"]),
+            update_args: Some(&["update"]),
+            manual_command: "droid update",
+        },
         HarnessId::Devin => ProviderSpec {
             version_args: &["--version"],
             latest: LatestSource::Manual,
