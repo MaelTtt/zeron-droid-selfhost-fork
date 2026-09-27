@@ -14,6 +14,7 @@ releases.
 | ba470911 | **Fork identity** — version `0.2.96-mael.1`; `zeron update` refuses to overwrite the fork while `ZERON_FORK` is set (points at `zeron-fork-update`); background auto-update disabled; `zeron status` shows the fork line | mael |
 | — | **Rewind** — rewind button in the hover strip under each sent message (click twice to confirm) plus double-Escape prompt list. For Droid and OpenCode chats it truncates the transcript from that message and drops the agent's session (`RewindChat` RPC); the next run starts a fresh session bootstrapped with the remaining transcript. Files are not reverted. Other harnesses only get the prompt text back | upstream PR #384 + mael |
 | 0502fe67 | 0.2.86 surface adaptation of the droid harness (install methods, skills dirs, spec fields, registry descriptor, auth test API) | mael |
+| 1f691a9c | **One-click update strip + droid fallback chip** — managed installs apply headless releases from the sidebar strip (`ApplyUpdate`: stage + swap + service restart, with updating/failed states); the fork build instead shows an advisory pointing at `zeron-fork-update` (stock would clobber the fork); ACP `config_option_update` model changes surface as an amber "Model switched" transcript chip (Droid's quota fallback onto its core models) | mael |
 
 Skipped on purpose: the PR's "Permission trait to every harness" commit (`ae4d39d1`) —
 upstream gained its own `crates/harness/src/permission.rs` in 0.2.86 that supersedes it.
