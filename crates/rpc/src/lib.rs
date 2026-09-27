@@ -59,6 +59,9 @@ pub mod methods {
     /// per pending command. Params `{chatId}`; IPC-only.
     pub const RETRY_DELIVERY: &str = "RetryDelivery";
     pub const FORK_SIDE_CHAT: &str = "ForkSideChat";
+    /// Drop a user message and everything after it, and the agent's provider
+    /// session with it. Params `{chatId, messageId}`; runs on the chat's host.
+    pub const REWIND_CHAT: &str = "RewindChat";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
     /// Explicit user navigation, `{chatId}`. Prioritizes this device's sync
     /// connection; automatic subscriptions and retries must not call it.

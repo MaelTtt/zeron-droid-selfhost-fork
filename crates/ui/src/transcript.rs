@@ -3237,6 +3237,10 @@ pub struct Transcript {
     /// Entry whose hover action is showing transient copied-check feedback.
     copied_message: Option<SharedString>,
     copied_message_clear: Option<Task<()>>,
+    /// User entry whose rewind button was clicked once: rewinding deletes
+    /// history, so it takes a second click while armed.
+    rewind_armed: Option<SharedString>,
+    rewind_armed_clear: Option<Task<()>>,
     /// Transcript attachment being viewed full-size (click a user thumbnail).
     attachment_preview: Option<crate::attachments::PreviewImage>,
     /// Focused while the lightbox is open so Escape reaches it.
@@ -3451,6 +3455,8 @@ impl Transcript {
             code_fences: HashMap::new(),
             copied_message: None,
             copied_message_clear: None,
+            rewind_armed: None,
+            rewind_armed_clear: None,
             attachment_preview: None,
             attachment_preview_focus: cx.focus_handle(),
             attachment_preview_return_focus: None,
@@ -4538,6 +4544,8 @@ impl Transcript {
             self.highlights.entries.clear();
             self.copied_message = None;
             self.copied_message_clear = None;
+            self.rewind_armed = None;
+            self.rewind_armed_clear = None;
             self.list.reset(0);
             self.pending_viewport = None;
             self.viewport_generation = self.viewport_generation.wrapping_add(1);
@@ -6560,6 +6568,7 @@ impl Transcript {
             .as_ref()
             .is_some_and(|(_, entry)| entry == &row.entry_id);
         let copied_message = self.copied_message.as_ref() == Some(&row.entry_id);
+        let rewind_armed = self.rewind_armed.as_ref() == Some(&row.entry_id);
         let copy_text = row.copy_text.clone();
         let copy_entry_id = row.entry_id.clone();
         let strip = row.timestamp.map(|ms| {
@@ -6616,15 +6625,21 @@ impl Transcript {
                         crate::theme::ink(0.08),
                     ))
                     .on_hover(motion::hover_listener(fade_key))
-                    .on_click(cx.listener(move |_, _, _, cx| {
-                        cx.emit(TranscriptEvent::RewindTo {
-                            entry_id: entry_id.to_string(),
-                        })
-                    }))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.click_rewind(entry_id.clone(), cx)),
+                    )
                     .child(
-                        crate::icons::icon(crate::icons::RESTART)
-                            .size(px(14.0))
-                            .text_color(theme.text_muted),
+                        crate::icons::icon(if rewind_armed {
+                            crate::icons::CHECK
+                        } else {
+                            crate::icons::RESTART
+                        })
+                        .size(px(14.0))
+                        .text_color(if rewind_armed {
+                            theme.danger
+                        } else {
+                            theme.text_muted
+                        }),
                     )
             });
             let metadata = div()
@@ -6771,6 +6786,31 @@ impl Transcript {
                 .inset_0(),
             )
             .into_any_element()
+    }
+
+    fn click_rewind(&mut self, entry_id: SharedString, cx: &mut Context<Self>) {
+        cx.stop_propagation();
+        if self.rewind_armed.as_ref() == Some(&entry_id) {
+            self.rewind_armed = None;
+            self.rewind_armed_clear = None;
+            cx.emit(TranscriptEvent::RewindTo {
+                entry_id: entry_id.to_string(),
+            });
+        } else {
+            self.rewind_armed = Some(entry_id);
+            self.rewind_armed_clear = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(3000))
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.rewind_armed = None;
+                    this.rewind_armed_clear = None;
+                    cx.notify();
+                })
+                .ok();
+            }));
+        }
+        cx.notify();
     }
 
     fn copy_message(&mut self, entry_id: SharedString, text: SharedString, cx: &mut Context<Self>) {

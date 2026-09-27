@@ -788,6 +788,56 @@ impl SessionsEngine {
         Ok(true)
     }
 
+    /// Rewind `chat_id` to just before the user message `message_id`: drop
+    /// that message and everything after it from the transcript, and drop
+    /// the agent's provider session so it forgets those turns too. The next
+    /// run starts a fresh provider session bootstrapped with what is left
+    /// (see `fork_history_prompt`). Refused while a turn is in flight.
+    pub async fn rewind(&self, chat_id: &str, message_id: &str) -> Result<usize, EngineError> {
+        if self.turn_in_flight(chat_id) {
+            return Err(EngineError::Other(
+                "Stop the agent before rewinding this chat".into(),
+            ));
+        }
+        let handle = self.doc_handle(chat_id)?;
+        let doc = handle.doc();
+        if !doc
+            .read_entries()
+            .map_err(|e| EngineError::Other(e.to_string()))?
+            .iter()
+            .any(|e| e.id == message_id && e.role == zeron_doc::MessageRole::User)
+        {
+            return Err(EngineError::Other(
+                "That message is no longer in this chat".into(),
+            ));
+        }
+        // A warm persistent child still holds the old provider session and
+        // would take the next prompt through its mailbox.
+        self.interrupt(chat_id).await?;
+        let cwd = lock(&self.inner.harness_sessions)
+            .get(chat_id)
+            .map(|known| known.cwd.clone())
+            .unwrap_or_default();
+        // Empty id = the explicit no-resume tombstone `resume_for` honours
+        // without falling back to the journal's older session ids.
+        lock(&self.inner.harness_sessions).insert(
+            chat_id.to_string(),
+            HarnessSessionRef {
+                session_id: String::new(),
+                cwd: cwd.clone(),
+            },
+        );
+        if let Some(ws) = self.inner.workspace() {
+            ws.set_chat_harness_session(chat_id, "", &cwd);
+        }
+        doc.set_rewound()
+            .map_err(|e| EngineError::Other(e.to_string()))?;
+        let removed = doc
+            .truncate_from(message_id)
+            .map_err(|e| EngineError::Other(e.to_string()))?;
+        Ok(removed)
+    }
+
     /// Resolve a pending `request_input` question set. Returns `false` when no such
     /// request is pending (unknown id, or the run already settled).
     pub fn respond_input(
@@ -1344,12 +1394,15 @@ impl Inner {
         current: Option<&str>,
         provider: ProviderSession<'_>,
     ) -> Option<String> {
-        if native_command(prompt, harness_id)
-            || !self
-                .workspace()
-                .and_then(|ws| ws.chat(chat_id).ok().flatten())
-                .is_some_and(|chat| chat.parent_chat_id.is_some())
-        {
+        if native_command(prompt, harness_id) {
+            return None;
+        }
+        let side_chat = self
+            .workspace()
+            .and_then(|ws| ws.chat(chat_id).ok().flatten())
+            .is_some_and(|chat| chat.parent_chat_id.is_some());
+        let rewound = doc.rewound();
+        if !side_chat && !rewound {
             return None;
         }
         let entries: Vec<_> = doc
@@ -1395,9 +1448,15 @@ impl Inner {
             .filter(|(_, text)| !text.is_empty())
             .map(|(role, text)| serde_json::json!({ "role": role, "text": text }))
             .collect();
+        let lead = if side_chat {
+            "Continue this side conversation using the following prior conversation as context."
+        } else {
+            "Continue this conversation using the following prior conversation as context. \
+             Anything that happened after it was rewound and never took place."
+        };
         (!history.is_empty()).then(|| {
             format!(
-                "Continue this side conversation using the following prior conversation as context.\n<conversation>\n{}\n</conversation>\n\n{}",
+                "{lead}\n<conversation>\n{}\n</conversation>\n\n{}",
                 serde_json::to_string(&history).unwrap_or_default(),
                 prompt
             )

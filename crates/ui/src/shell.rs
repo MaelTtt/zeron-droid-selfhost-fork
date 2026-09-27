@@ -3810,11 +3810,7 @@ impl Shell {
                 else {
                     return;
                 };
-                self.composer
-                    .update(cx, |composer, cx| composer.set_prompt(&prompt.text, cx));
-                // Event handlers get no `Window`; focus lands on the next frame.
-                self.composer_focus_pending = true;
-                cx.notify();
+                self.rewind_to(prompt, cx);
             }
         }
     }
@@ -9124,11 +9120,8 @@ impl Shell {
         self.restore_prompt(prompt, window, cx);
     }
 
-    /// Put a previous prompt back in the composer, ready to edit and resend.
-    ///
-    /// Deliberately does not touch the transcript — see the `crate::rewind`
-    /// module docs for why truncating our mirror would lie about what the
-    /// agent still remembers.
+    /// Put a previous prompt back in the composer, ready to edit and resend,
+    /// rewinding the chat to before it where the harness supports that.
     fn restore_prompt(
         &mut self,
         prompt: crate::rewind::RewindPrompt,
@@ -9138,9 +9131,51 @@ impl Shell {
         // Close first: it hands focus back, which must happen before the
         // caret lands at the end of the restored text.
         self.close_rewind(window, cx);
+        self.rewind_to(prompt, cx);
+    }
+
+    /// For harnesses in [`crate::rewind::truncates`], ask the chat's host to
+    /// drop the prompt and everything after it (transcript and agent
+    /// session) and restore the text only once that succeeded; otherwise
+    /// just restore the text.
+    fn rewind_to(&mut self, prompt: crate::rewind::RewindPrompt, cx: &mut Context<Self>) {
+        let chat = self.state.read(cx).selected_chat_row().cloned();
+        let engine = self.state.read(cx).engine().cloned();
+        let real = chat
+            .as_ref()
+            .and_then(|c| c.config.as_ref())
+            .is_some_and(|config| crate::rewind::truncates(config.harness));
+        let (Some(chat), Some(engine), true) = (chat, engine, real) else {
+            self.restore_prompt_text(&prompt.text, cx);
+            return;
+        };
+        let params = serde_json::json!({
+            "chatId": chat.id,
+            "messageId": prompt.message_id,
+            "targetDeviceId": chat.device_id,
+        });
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(zeron_rpc::methods::REWIND_CHAT, params)
+                .await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(_) => this.restore_prompt_text(&prompt.text, cx),
+                Err(error) => {
+                    let message = format!("Could not rewind: {error}");
+                    this.composer
+                        .update(cx, |composer, cx| composer.show_error(message, cx));
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn restore_prompt_text(&mut self, text: &str, cx: &mut Context<Self>) {
         self.composer
-            .update(cx, |composer, cx| composer.set_prompt(&prompt.text, cx));
-        window.focus(&self.composer.focus_handle(cx), cx);
+            .update(cx, |composer, cx| composer.set_prompt(text, cx));
+        // Callers may have no `Window`; focus lands on the next frame.
+        self.composer_focus_pending = true;
         cx.notify();
     }
 

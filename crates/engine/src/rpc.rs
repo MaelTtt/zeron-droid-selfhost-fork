@@ -1337,6 +1337,7 @@ fn forwardable(method: &str) -> bool {
     matches!(
         method,
         methods::FORK_SIDE_CHAT
+            | methods::REWIND_CHAT
             | methods::LIST_HARNESSES
             | methods::INSTALL_HARNESS
             | methods::CANCEL_INSTALL
@@ -1851,6 +1852,32 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "outcome": outcome }))
+            }
+            methods::REWIND_CHAT => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct RewindParams {
+                    chat_id: String,
+                    message_id: String,
+                }
+                let p: RewindParams = parse_params(params)?;
+                let failed = |e: crate::EngineError| RpcError::Failed(e.to_string());
+                let chat = self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .map_err(failed)?
+                    .ok_or_else(|| RpcError::Failed("Chat no longer exists".into()))?;
+                if chat.device_id != self.doc_host.device_id() {
+                    return Err(RpcError::Failed(
+                        "Rewind must run on the chat's device".into(),
+                    ));
+                }
+                let removed = self
+                    .sessions
+                    .rewind(&p.chat_id, &p.message_id)
+                    .await
+                    .map_err(failed)?;
+                RpcReply::value(&serde_json::json!({ "removed": removed }))
             }
             methods::FORK_SIDE_CHAT => {
                 #[derive(Deserialize)]
