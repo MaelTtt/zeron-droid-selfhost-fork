@@ -3,18 +3,25 @@
 //!
 //! ## What this does and does not do
 //!
-//! Selecting a prompt restores its text and scrolls the transcript to it. It
-//! does **not** delete the turns that followed, and it does not roll the agent
-//! back. It cannot: the harness CLI owns the conversation, and the app resumes
-//! it by `RunRequest::resume` (a harness-native session id) rather than
-//! replaying history out of the doc. Truncating our mirror would leave the
-//! agent still remembering everything the transcript no longer showed — a
-//! worse lie than not truncating at all. Real truncation needs harness-side
-//! support plumbed through the `Harness` trait and the command ledger.
+//! For harnesses in [`truncates`], the chat's host drops the prompt and every
+//! later entry from the transcript AND drops the agent's provider session
+//! (`RewindChat`); the next run starts a fresh session bootstrapped with the
+//! remaining transcript, so the agent forgets the rewound turns. File edits
+//! the agent made after that point are NOT reverted.
+//!
+//! Other harnesses only get the text back: truncating the mirror while their
+//! resumed session still remembered the turns would be a worse lie than not
+//! truncating at all.
 //!
 //! The extraction below is pure and tested; the shell owns the overlay.
 
 use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
+use zeron_proto::HarnessId;
+
+/// Harnesses whose rewind really truncates (transcript + agent session).
+pub fn truncates(harness: HarnessId) -> bool {
+    matches!(harness, HarnessId::Droid | HarnessId::Opencode)
+}
 
 /// One restorable prompt.
 #[derive(Debug, Clone, PartialEq, Eq)]
