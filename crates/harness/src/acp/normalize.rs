@@ -441,9 +441,30 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
                 Vec::new()
             }
         }
-        "current_mode_update" | "config_option_update" | "session_info_update" => Vec::new(),
+        "config_option_update" => model_from_config_update(update)
+            .map(|to| vec![AgentEvent::ModelSwitched { from: None, to }])
+            .unwrap_or_default(),
+        "current_mode_update" | "session_info_update" => Vec::new(),
         _ => Vec::new(),
     }
+}
+
+/// The live model id a `config_option_update` advertises — the `model`
+/// category option's `currentValue` (droid re-emits the full configOptions
+/// array on every settings change; a quota fallback onto its core models
+/// rewrites it). Absent/empty → nothing.
+fn model_from_config_update(update: &Value) -> Option<String> {
+    update
+        .get("configOptions")?
+        .as_array()?
+        .iter()
+        .filter(|o| o.get("category").and_then(Value::as_str) == Some("model"))
+        .find_map(|o| {
+            o.get("currentValue")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+        })
 }
 
 /// A terminal `status` on a tool_call/tool_call_update resolves the call:
@@ -667,6 +688,60 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn config_option_update_yields_model_switch() {
+        // Droid's wire shape: the FULL configOptions array re-emitted on any
+        // settings change; the live model is the `model` option's currentValue.
+        let update = json!({
+            "sessionUpdate": "config_option_update",
+            "configOptions": [
+                {
+                    "id": "autonomy_level",
+                    "name": "Autonomy Level",
+                    "category": "mode",
+                    "type": "select",
+                    "currentValue": "auto-high",
+                    "options": [{ "value": "auto-high", "name": "Auto (High)" }],
+                },
+                {
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "droid-core-v1.5",
+                    "options": [{ "value": "droid-core-v1.5", "name": "Droid Core 1.5" }],
+                },
+                {
+                    "id": "reasoning_effort",
+                    "name": "Reasoning Effort",
+                    "category": "thought_level",
+                    "type": "select",
+                    "currentValue": "high",
+                },
+            ],
+        });
+        assert_eq!(
+            map_update(&update),
+            vec![AgentEvent::ModelSwitched {
+                from: None,
+                to: "droid-core-v1.5".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn config_option_update_without_model_option_is_noise() {
+        // Autonomy/effort changes re-emit the same shape — no model option,
+        // no chip (the run loop dedups the rest).
+        let update = json!({
+            "sessionUpdate": "config_option_update",
+            "configOptions": [
+                { "id": "autonomy_level", "category": "mode", "currentValue": "auto-low" },
+            ],
+        });
+        assert_eq!(map_update(&update), Vec::new());
     }
 
     #[test]
