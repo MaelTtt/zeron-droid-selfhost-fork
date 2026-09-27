@@ -4,7 +4,7 @@ A maintained local fork of [zeronsh/zeron](https://github.com/zeronsh/zeron) (MI
 two upstream PRs which haven't merged yet, plus a fork identity layer, on top of official
 releases.
 
-## What's in the fork (commits on `mael/main`, rebased onto the official release)
+## What's in the fork (commits on `main`, rebased onto the official release)
 
 | commit | what | origin |
 | --- | --- | --- |
@@ -22,7 +22,7 @@ When upstream #372 merges, the rebase will naturally drop what upstream already 
 ## Versioning
 
 - Fork version = `<upstream version>-mael.<n>` (currently `0.2.96-mael.1`), tag
-  `mael/v<version>` on `mael/main`.
+  `mael/v<version>` on `main`.
 - The `-mael.1` suffix is stripped before the numeric compare in `version_newer`,
   so `zeron update --check` correctly reports a newer official release as
   available — and, with `ZERON_FORK` set, points at `zeron-fork-update` instead

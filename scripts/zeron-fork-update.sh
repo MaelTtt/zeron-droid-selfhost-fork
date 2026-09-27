@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Take an official Zeron release while keeping the mael fork patches.
 #
-# Rebase the fork commits (everything on mael/main past the upstream cut
+# Rebase the fork commits (everything on main past the upstream cut
 # point) onto a newer upstream release, bump the workspace version to
 # <upstream>-mael.<n>, rebuild in release mode, and swap the binary into the
 # versioned install layout (~/.zeron/app/fork-<ver> + `current` symlink).
@@ -32,7 +32,7 @@ git diff-index --quiet HEAD -- 2>/dev/null \
     || die "working tree is dirty — commit or stash first."
 
 BRANCH="$(git branch --show-current)"
-[ "$BRANCH" = "mael/main" ] || die "expected branch mael/main, on $BRANCH."
+[ "$BRANCH" = "main" ] || die "expected branch main, on $BRANCH."
 
 if ! git remote get-url upstream >/dev/null 2>&1; then
     say "adding upstream remote ($UPSTREAM_URL)"
@@ -128,7 +128,7 @@ if git rev-parse -q --verify "refs/tags/mael/v$NEWVER" >/dev/null; then
     say "tag mael/v$NEWVER already exists"
 else
     git tag "mael/v$NEWVER"
-    say "tagged mael/v$NEWVER (push with: git push origin mael/main mael/v$NEWVER)"
+    say "tagged mael/v$NEWVER (push with: git push origin main mael/v$NEWVER)"
 fi
 
 if [ "${SKIP_DAEMON:-0}" != "1" ]; then

@@ -1,6 +1,6 @@
 # Installing the Zeron desktop app from this fork
 
-The **desktop app** (UI + engine) from `mael/main` on another Linux PC, in
+The **desktop app** (UI + engine) from `main` on another Linux PC, in
 ~5 minutes of terminal time + one coffee for the build.
 
 What you get: `zeron` CLI, the gpui desktop app (in your launcher with an
@@ -18,13 +18,13 @@ mael's homelab edge with **no Zeron account** (self-hosted, `AUTH_MODE=none`).
 ## Easiest: one-shot script
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MaelTtt/zeron-droid-selfhost-fork/mael/main/scripts/install-desktop.sh | bash
+curl -fsSL https://raw.githubusercontent.com/MaelTtt/zeron-droid-selfhost-fork/main/scripts/install-desktop.sh | bash
 ```
 
 or, if you prefer to read before running:
 
 ```bash
-git clone -b mael/main git@github.com:MaelTtt/zeron-droid-selfhost-fork.git ~/.build/zeron
+git clone -b main git@github.com:MaelTtt/zeron-droid-selfhost-fork.git ~/.build/zeron
 cd ~/.build/zeron
 ./scripts/install-desktop.sh
 ```
@@ -33,7 +33,7 @@ It does, in this order:
 
 1. **Deps** — distro-aware (`pacman` / `apt-get` / `dnf`): toolchain, clang, X/wayland libs, WebKitGTK 4.1 (needed to link the Linux browser helper — gpui links these even for headless; upstream install-script bug `zeronsh/zeron#197` describes the same thing).
 2. **Rust** — installs stable via rustup if `cargo` isn't on PATH.
-3. **Clone/pull** the fork to `~/.build/zeron` (branch `mael/main`).
+3. **Clone/pull** the fork to `~/.build/zeron` (branch `main`).
 4. **Build** — `cargo build --release -p zeron` (10–20 min).
 5. **Install** the binary at `~/.zeron/app/fork-<version>/zeron` with a `.mael-fork` marker; `~/.zeron/app/current` → that dir; `~/.local/bin/zeron` symlink for PATH; `~/.local/bin/zeron-fork-update` helper for taking future official releases.
 6. **Desktop entry + icon** — `~/.local/share/applications/zeron.desktop` with **absolute** `Exec` (krunner has no `~/.local/bin` in PATH — this is why "type `zeron` in the launcher" failed before), `StartupWMClass=zeron`, icon in hicolor, caches refreshed (update-desktop-database + kbuildsycoca6 + gtk-update-icon-cache).
@@ -78,7 +78,7 @@ It's a *linked* theme: because it points at the copied repo bundle, a future
 ## Updating later
 
 - On the fork's home PC: `zeron-fork-update` rebases the fork onto the next official release and rebuilds.
-- On other machines, re-run `./scripts/install-desktop.sh` (it pulls `mael/main`, rebuilds only if the build changed, and swaps the binary).
+- On other machines, re-run `./scripts/install-desktop.sh` (it pulls `main`, rebuilds only if the build changed, and swaps the binary).
 - Never run stock `zeron update` while the fork is installed — the fork's guard refuses with a pointer to `zeron-fork-update` (see FORK.md).
 
 ## Troubleshooting
