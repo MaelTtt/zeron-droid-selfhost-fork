@@ -1056,6 +1056,12 @@ pub enum RowKind {
     ErrorChip {
         message: SharedString,
     },
+    /// A neutral informational chip (mid-session model switch — Droid's
+    /// quota fallback to its core models is the motivating case). Amber
+    /// attention treatment, not failure.
+    NoticeChip {
+        message: SharedString,
+    },
     /// The fork seam: a labeled divider between copied history and the
     /// chat's own turns.
     ForkMarker {
@@ -1616,6 +1622,24 @@ pub fn rows_for_entry(
                             version: message.len() as u64,
                             turn_start: false,
                             kind: RowKind::ErrorChip {
+                                // Harness-generated; the chip is one line.
+                                message: single_line(message).into(),
+                            },
+                            entry_id: entry_id.clone(),
+                            timestamp: None,
+                            copy_text: None,
+                            compact_fold: None,
+                        });
+                    }
+                    MessagePart::Notice {
+                        id: part_id,
+                        message,
+                    } => {
+                        rows.push(Row {
+                            id: format!("{}#{}", entry.id, part_id).into(),
+                            version: message.len() as u64,
+                            turn_start: false,
+                            kind: RowKind::NoticeChip {
                                 // Harness-generated; the chip is one line.
                                 message: single_line(message).into(),
                             },
@@ -6554,6 +6578,7 @@ impl Transcript {
                 mime_type,
             } => self.render_generated_image(&row.id, owner, path, name, mime_type, cx),
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
+            RowKind::NoticeChip { message } => notice_chip_row(message.clone(), &theme),
             RowKind::ForkMarker { source_title, .. } => fork_marker(source_title.clone(), &theme),
         };
 
@@ -7818,6 +7843,21 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
         .w_full()
         .child(
             notice_chip(theme, false, "Error", message, Tile)
+                .overflow_hidden()
+                .w_full(),
+        )
+        .into_any_element()
+}
+
+/// The transcript NoticeChip — the shared [`notice_chip`] in its amber
+/// (non-failure) treatment: a mid-session model switch the agent announced
+/// itself, e.g. Droid falling back to its core models on quota exhaustion.
+fn notice_chip_row(message: SharedString, theme: &Theme) -> AnyElement {
+    div()
+        .py(px(4.0))
+        .w_full()
+        .child(
+            notice_chip(theme, true, "Model switched", message, Tile)
                 .overflow_hidden()
                 .w_full(),
         )

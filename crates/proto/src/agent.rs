@@ -550,6 +550,18 @@ pub enum AgentEvent {
     Error {
         message: String,
     },
+    /// The agent changed its model MID-SESSION — ACP `config_option_update`
+    /// rewriting the `model` config option (Droid falling back to its core
+    /// models when standard quota runs out is the motivating case; a switch
+    /// through the agent's own UI surfaces the same way). `from` is None
+    /// when the previous model is unknown. Persisted as a transcript
+    /// notice chip.
+    #[serde(rename_all = "camelCase")]
+    ModelSwitched {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+        to: String,
+    },
     #[serde(rename_all = "camelCase")]
     InputRequested {
         request_id: String,

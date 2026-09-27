@@ -716,9 +716,26 @@ impl UpdateStatus {
     }
 }
 
+/// Is this a mael-fork build? The fork lays a `.mael-fork` marker next to
+/// its binary (env vars don't reach every process the binary runs in) and
+/// may also set `ZERON_FORK`; either is authoritative. Update surfaces use
+/// it to point at `zeron-fork-update` instead of a stock overwrite.
+pub fn is_fork_install() -> bool {
+    if std::env::var("ZERON_FORK").is_ok_and(|v| !v.trim().is_empty()) {
+        return true;
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            let marker = exe.parent()?.join(".mael-fork");
+            marker.exists().then_some(marker)
+        })
+        .is_some()
+}
+
 /// `ZERON_AUTO_UPDATE=1|true|yes` — headless daemons apply updates themselves.
 fn auto_update_enabled() -> bool {
-    if std::env::var("ZERON_FORK").is_ok_and(|v| !v.trim().is_empty()) {
+    if is_fork_install() {
         tracing::info!("update swapped out by the fork guard");
         return false;
     }

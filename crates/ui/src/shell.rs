@@ -1371,6 +1371,9 @@ enum UpdateFlow {
     Downloading,
     /// Staged bundle ready to swap in — one click restarts into it.
     Ready(PathBuf),
+    /// Managed (headless) apply in flight — the `ApplyUpdate` RPC stages,
+    /// swaps, and restarts the engine service; the strip waits on it.
+    Applying,
     Failed(SharedString),
 }
 
@@ -1954,6 +1957,9 @@ pub struct Shell {
     /// How this binary was installed — decides the strip's click behavior.
     /// Cached: `detect_install` stats `current_exe` and this renders per frame.
     install: zeron_update::InstallKind,
+    /// mael-fork build (`.mael-fork` marker / `ZERON_FORK`) — the strip may
+    /// detect a newer release, but applying stock would clobber the fork.
+    fork: bool,
     org: Option<OrgGateUi>,
     sync_flow: SyncFlow,
     mutate_task: Option<Task<()>>,
@@ -2381,6 +2387,7 @@ impl Shell {
             update_task: None,
             update_dismissed: None,
             install: zeron_update::detect_install(),
+            fork: zeron_update::is_fork_install(),
             org: None,
             sync_flow: SyncFlow::Idle,
             mutate_task: None,
@@ -8106,7 +8113,7 @@ impl Shell {
             return None;
         }
         let (label, clickable) =
-            Self::update_strip_label(&self.install, &self.update_flow, &latest);
+            Self::update_strip_label(&self.install, &self.update_flow, &latest, self.fork);
         let failed = matches!(self.update_flow, UpdateFlow::Failed(_));
         let tone = if failed { theme.danger } else { theme.accent };
         // Follow the selected spectrum with a low-emphasis glass tint rather
@@ -8144,26 +8151,43 @@ impl Shell {
 
     /// The update strip's label and click affordance per install kind. Desktop
     /// update installs (macOS bundles, Windows portable packages) drive their
-    /// flow from the strip; managed installs get the `zeron update` hint;
-    /// unmanaged installs (source builds, hand-copied binaries) are pointed at
-    /// the GitHub releases page.
+    /// flow from the strip; managed installs apply the headless release from
+    /// the strip too (`ApplyUpdate`: stage + swap + service restart) — except
+    /// a fork build, which a stock release would overwrite, so it only points
+    /// at `zeron-fork-update`; unmanaged installs (source builds,
+    /// hand-copied binaries) are pointed at the GitHub releases page.
     fn update_strip_label(
         install: &zeron_update::InstallKind,
         flow: &UpdateFlow,
         latest: &str,
+        fork: bool,
     ) -> (SharedString, bool) {
         if install.supports_desktop_update() {
             match flow {
                 UpdateFlow::Idle => (format!("Update available — v{latest}").into(), true),
                 UpdateFlow::Downloading => (format!("Downloading v{latest}…").into(), false),
+                UpdateFlow::Applying => (format!("Updating to v{latest}…").into(), false),
                 UpdateFlow::Ready(_) => ("Update ready — restart to apply".into(), true),
                 UpdateFlow::Failed(message) => (format!("Update failed: {message}").into(), true),
             }
         } else if matches!(install, zeron_update::InstallKind::Managed { .. }) {
-            (
-                format!("Update available — v{latest} · run `zeron update`").into(),
-                true,
-            )
+            if fork {
+                (
+                    format!("Update available — v{latest} · run `zeron-fork-update`").into(),
+                    true,
+                )
+            } else {
+                match flow {
+                    UpdateFlow::Applying => (format!("Updating to v{latest}…").into(), false),
+                    UpdateFlow::Failed(message) => {
+                        (format!("Update failed: {message}").into(), true)
+                    }
+                    _ => (
+                        format!("Update available — v{latest} · click to update").into(),
+                        true,
+                    ),
+                }
+            }
         } else {
             (
                 format!("Update available — v{latest} · download from GitHub").into(),
@@ -8172,10 +8196,58 @@ impl Shell {
         }
     }
 
-    /// Idle → download; Ready → swap + relaunch; Failed → retry; advisory
-    /// installs (managed: `zeron update`, unmanaged: the GitHub releases page)
-    /// → open the destination if there is one, then dismiss for this version.
+    /// Idle → download; Ready → swap + relaunch; Failed → retry; managed
+    /// installs → the engine's `ApplyUpdate` (stages the headless release,
+    /// swaps it, restarts the service); advisory installs (a fork build:
+    /// `zeron-fork-update`, unmanaged: the GitHub releases page) → open the
+    /// destination if there is one, then dismiss for this version.
     fn on_update_strip_click(&mut self, cx: &mut Context<Self>) {
+        // Managed stock installs: the engine updates itself in place. The
+        // strip waits on the RPC (stage + swap + service restart — the reply
+        // flushes before systemd kills the process), then hides: the fresh
+        // engine reports up to date when it rejoins.
+        if matches!(self.install, zeron_update::InstallKind::Managed { .. }) && !self.fork {
+            if matches!(self.update_flow, UpdateFlow::Applying) {
+                return;
+            }
+            let Some(engine) = self.state.read(cx).engine().cloned() else {
+                self.update_flow = UpdateFlow::Failed("Engine not connected".into());
+                cx.notify();
+                return;
+            };
+            self.update_flow = UpdateFlow::Applying;
+            let apply = Tokio::spawn(cx, async move {
+                engine
+                    .client()
+                    .call(methods::APPLY_UPDATE, serde_json::json!({}))
+                    .await
+            });
+            self.update_task = Some(cx.spawn(async move |this, cx| {
+                let outcome = match apply.await {
+                    Ok(Ok(reply)) => Ok(reply
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)),
+                    Ok(Err(err)) => Err(format!("{err:#}")),
+                    Err(join_err) => Err(join_err.to_string()),
+                };
+                this.update(cx, |shell, cx| {
+                    shell.update_flow = match outcome {
+                        Ok(version) => {
+                            // Hide the strip until the restarted engine's
+                            // first status frame re-evaluates availability.
+                            shell.update_dismissed = version;
+                            UpdateFlow::Idle
+                        }
+                        Err(message) => UpdateFlow::Failed(message.into()),
+                    };
+                    cx.notify();
+                })
+                .ok();
+            }));
+            cx.notify();
+            return;
+        }
         if !self.install.supports_desktop_update() {
             if matches!(self.install, zeron_update::InstallKind::Unmanaged) {
                 cx.open_url(zeron_update::RELEASES_PAGE);
@@ -8191,7 +8263,9 @@ impl Shell {
         }
         match std::mem::replace(&mut self.update_flow, UpdateFlow::Idle) {
             UpdateFlow::Idle | UpdateFlow::Failed(_) => self.begin_update_download(cx),
-            UpdateFlow::Downloading => self.update_flow = UpdateFlow::Downloading,
+            UpdateFlow::Downloading | UpdateFlow::Applying => {
+                self.update_flow = UpdateFlow::Downloading;
+            }
             UpdateFlow::Ready(staged) => self.apply_staged_update(staged, cx),
         }
     }
@@ -12923,20 +12997,39 @@ mod tests {
 
     #[test]
     fn update_strip_labels_cover_every_install_kind() {
-        // Managed (curl|sh daemon layout): the CLI hint.
+        // Managed (curl|sh daemon layout), stock: one click applies the
+        // headless release (stage + swap + service restart).
         let managed = zeron_update::InstallKind::Managed {
             app_root: PathBuf::from("/home/u/.zeron/app"),
         };
+        let stock = Shell::update_strip_label(&managed, &UpdateFlow::Idle, "0.2.86", false);
         assert_eq!(
-            Shell::update_strip_label(&managed, &UpdateFlow::Idle, "0.2.86").0,
-            SharedString::from("Update available — v0.2.86 · run `zeron update`")
+            stock.0,
+            SharedString::from("Update available — v0.2.86 · click to update")
         );
+        assert!(stock.1);
+        assert_eq!(
+            Shell::update_strip_label(&managed, &UpdateFlow::Applying, "0.2.86", false).0,
+            SharedString::from("Updating to v0.2.86…")
+        );
+        assert!(
+            !Shell::update_strip_label(&managed, &UpdateFlow::Applying, "0.2.86", false).1
+        );
+        // Managed, fork build: applying stock would clobber the fork — the
+        // strip points at the fork's own updater instead.
+        let fork = Shell::update_strip_label(&managed, &UpdateFlow::Idle, "0.2.86", true);
+        assert_eq!(
+            fork.0,
+            SharedString::from("Update available — v0.2.86 · run `zeron-fork-update`")
+        );
+        assert!(fork.1);
         // Unmanaged (source builds, hand-copied binaries — bare Windows
         // release exes): the GitHub releases page, clickable to open it.
         let unmanaged = Shell::update_strip_label(
             &zeron_update::InstallKind::Unmanaged,
             &UpdateFlow::Idle,
             "0.2.86",
+            false,
         );
         assert_eq!(
             unmanaged.0,
@@ -12949,12 +13042,14 @@ mod tests {
             bundle: PathBuf::from("/Applications/Zeron.app"),
         };
         assert_eq!(
-            Shell::update_strip_label(&mac_app, &UpdateFlow::Downloading, "0.2.86").0,
+            Shell::update_strip_label(&mac_app, &UpdateFlow::Downloading, "0.2.86", false).0,
             SharedString::from("Downloading v0.2.86…")
         );
-        assert!(!Shell::update_strip_label(&mac_app, &UpdateFlow::Downloading, "0.2.86").1);
+        assert!(
+            !Shell::update_strip_label(&mac_app, &UpdateFlow::Downloading, "0.2.86", false).1
+        );
         assert_eq!(
-            Shell::update_strip_label(&mac_app, &UpdateFlow::Idle, "0.2.86").0,
+            Shell::update_strip_label(&mac_app, &UpdateFlow::Idle, "0.2.86", false).0,
             SharedString::from("Update available — v0.2.86")
         );
     }
@@ -12966,10 +13061,10 @@ mod tests {
             directory: PathBuf::from(r"C:\Users\u\AppData\Local\Programs\Zeron"),
         };
         assert_eq!(
-            Shell::update_strip_label(&portable, &UpdateFlow::Idle, "0.2.86").0,
+            Shell::update_strip_label(&portable, &UpdateFlow::Idle, "0.2.86", false).0,
             SharedString::from("Update available — v0.2.86")
         );
-        assert!(Shell::update_strip_label(&portable, &UpdateFlow::Idle, "0.2.86").1);
+        assert!(Shell::update_strip_label(&portable, &UpdateFlow::Idle, "0.2.86", false).1);
     }
 
     #[test]

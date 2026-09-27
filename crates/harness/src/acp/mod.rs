@@ -2675,17 +2675,23 @@ impl SubagentObserver {
 /// `subagent_*` lifecycle) render nothing directly. The subagent tracker sees
 /// both first (spawn/finished correlation + transcript tails); its tagged
 /// events flow from its own tasks, not this return value.
+///
+/// `model` tracks the session's live model id (seeded from the run request's
+/// pick): `config_option_update` re-emits on EVERY settings change, so only a
+/// genuine model change becomes a [`AgentEvent::ModelSwitched`], with `from`
+/// filled from the last known value.
 fn session_update_events(
     method: &str,
     params: &Value,
     session_id: &str,
     subagents: &mut SubagentObserver,
+    model: &mut Option<String>,
 ) -> Vec<AgentEvent> {
     if params.get("sessionId").and_then(Value::as_str) != Some(session_id) {
         return Vec::new();
     }
     let update = params.get("update").unwrap_or(&Value::Null);
-    match method {
+    let events = match method {
         "session/update" => match subagents {
             SubagentObserver::Devin(tracker) => tracker.map(update),
             _ => {
@@ -2698,7 +2704,32 @@ fn session_update_events(
             Vec::new()
         }
         _ => Vec::new(),
-    }
+    };
+    dedup_model_switches(events, model)
+}
+
+/// Keep only genuine model changes: `config_option_update` re-emits the full
+/// option set on every settings change, so an unchanged model must not chip.
+/// A change fills `from` from the session's last known value (None = unknown).
+fn dedup_model_switches(
+    events: Vec<AgentEvent>,
+    model: &mut Option<String>,
+) -> Vec<AgentEvent> {
+    events
+        .into_iter()
+        .filter_map(|event| match event {
+            AgentEvent::ModelSwitched { to, .. } => {
+                if model.as_deref() == Some(to.as_str()) {
+                    None
+                } else {
+                    let from = model.take();
+                    *model = Some(to.clone());
+                    Some(AgentEvent::ModelSwitched { from, to })
+                }
+            }
+            other => Some(other),
+        })
+        .collect()
 }
 
 /// Per-turn token usage from a settled `session/prompt` response, when the
@@ -3583,6 +3614,11 @@ async fn run_session(session: Session) {
         ))
     };
 
+    // The session's live model id — seeded from the run request's pick,
+    // maintained by `session_update_events` off `config_option_update`
+    // (dedup: only genuine changes become ModelSwitched chips).
+    let mut session_model: Option<String> = request.model.clone();
+
     // ---- main loop --------------------------------------------------------
     // Prompt-completion settlement state (the prompt-complete extension):
     // one prompt is outstanding at a time, identified by `current_prompt_id`;
@@ -3761,7 +3797,7 @@ async fn run_session(session: Session) {
                     match inc {
                         Incoming::Notification { method, params } => {
                             let events =
-                                session_update_events(&method, &params, &session_id, &mut subagents);
+                                session_update_events(&method, &params, &session_id, &mut subagents, &mut session_model);
                             for ev in events {
                                 if !send(&event_tx, ev).await {
                                     consumer_gone = true;
@@ -3974,7 +4010,7 @@ async fn run_session(session: Session) {
                     // Other notifications (other sessions, agent noise) are
                     // tolerated by design.
                     let events =
-                        session_update_events(&method, &params, &session_id, &mut subagents);
+                        session_update_events(&method, &params, &session_id, &mut subagents, &mut session_model);
                     for ev in events {
                         track_open_tools(&ev, &mut open_tools);
                         if !send(&event_tx, ev).await {
@@ -4095,7 +4131,7 @@ async fn run_session(session: Session) {
                             match inc {
                                 Incoming::Notification { method, params } => {
                                     let events =
-                                        session_update_events(&method, &params, &session_id, &mut subagents);
+                                        session_update_events(&method, &params, &session_id, &mut subagents, &mut session_model);
                                     for ev in events {
                                         if !send(&event_tx, ev).await {
                                             consumer_gone = true;
@@ -4549,6 +4585,65 @@ async fn run_session(session: Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_switch_dedup_fills_from_and_drops_noops() {
+        let mut model: Option<String> = Some("gpt-5.6-sol".into());
+        let events = vec![
+            AgentEvent::TextDelta { text: "hi".into() },
+            // Noop: droid re-emits configOptions on every settings change.
+            AgentEvent::ModelSwitched {
+                from: None,
+                to: "gpt-5.6-sol".into(),
+            },
+            // The quota fallback: a real change, `from` filled from the
+            // session's last known model.
+            AgentEvent::ModelSwitched {
+                from: None,
+                to: "droid-core-v1.5".into(),
+            },
+            AgentEvent::ModelSwitched {
+                from: None,
+                to: "auto".into(),
+            },
+        ];
+        let out = dedup_model_switches(events, &mut model);
+        assert_eq!(
+            out,
+            vec![
+                AgentEvent::TextDelta { text: "hi".into() },
+                AgentEvent::ModelSwitched {
+                    from: Some("gpt-5.6-sol".into()),
+                    to: "droid-core-v1.5".into(),
+                },
+                AgentEvent::ModelSwitched {
+                    from: Some("droid-core-v1.5".into()),
+                    to: "auto".into(),
+                },
+            ]
+        );
+        assert_eq!(model.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn model_switch_dedup_seeds_from_unknown() {
+        let mut model: Option<String> = None;
+        let out = dedup_model_switches(
+            vec![AgentEvent::ModelSwitched {
+                from: None,
+                to: "auto".into(),
+            }],
+            &mut model,
+        );
+        assert_eq!(
+            out,
+            vec![AgentEvent::ModelSwitched {
+                from: None,
+                to: "auto".into(),
+            }]
+        );
+        assert_eq!(model.as_deref(), Some("auto"));
+    }
 
     #[test]
     fn pi_discovery_allows_cold_extension_startup() {
