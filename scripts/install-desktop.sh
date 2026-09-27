@@ -6,7 +6,7 @@
 #   - fork identity + update guard (see FORK.md)
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/MaelTtt/zeron-droid-selfhost-fork/mael/main/scripts/install-desktop.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/MaelTtt/zeron-droid-selfhost-fork/main/scripts/install-desktop.sh | bash
 # ...or clone first and run ./scripts/install-desktop.sh
 #
 # Optional env:
@@ -52,11 +52,11 @@ rustc --version
 say "clone/pull fork into $CLONE_DIR"
 mkdir -p "$(dirname "$CLONE_DIR")"
 if [ ! -d "$CLONE_DIR/.git" ]; then
-    git clone -b mael/main "$REPO" "$CLONE_DIR"
+    git clone -b main "$REPO" "$CLONE_DIR"
 else
     cd "$CLONE_DIR"
-    git fetch origin mael/main -q
-    git reset --hard origin/mael/main -q   # install dir: remote is source of truth
+    git fetch origin main -q
+    git reset --hard origin/main -q   # install dir: remote is source of truth
     git clean -fdq target 2>/dev/null || true
 fi
 cd "$CLONE_DIR"
