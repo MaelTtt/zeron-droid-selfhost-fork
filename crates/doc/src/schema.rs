@@ -213,6 +213,12 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             message: Some(message.clone()),
             ..Default::default()
         },
+        MessagePart::Notice { id, message } => DocPartJson {
+            id: id.clone(),
+            kind: "notice".into(),
+            message: Some(message.clone()),
+            ..Default::default()
+        },
         MessagePart::Fork {
             id,
             source_chat_id,
@@ -267,6 +273,10 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
             resolved: p.resolved.unwrap_or(false),
         },
         "error" => MessagePart::Error {
+            id: p.id,
+            message: p.message.unwrap_or_default(),
+        },
+        "notice" => MessagePart::Notice {
             id: p.id,
             message: p.message.unwrap_or_default(),
         },
