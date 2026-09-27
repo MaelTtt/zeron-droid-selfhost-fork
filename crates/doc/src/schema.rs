@@ -591,6 +591,45 @@ impl SessionDoc {
         Err(DocError::Schema(format!("command {command_id} not found")))
     }
 
+    /// Delete the entry `message_id` and every entry after it. Returns how
+    /// many entries went, 0 when no entry has that id. Callers must hold no
+    /// live [`SegmentWriter`] on this doc: writers address entries by index.
+    pub fn truncate_from(&self, message_id: &str) -> Result<usize, DocError> {
+        let messages = self.doc.get_list("messages");
+        let len = messages.len();
+        for i in 0..len {
+            if let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) =
+                messages.get(i)
+                && matches!(
+                    map.get("id"),
+                    Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == message_id
+                )
+            {
+                messages.delete(i, len - i)?;
+                self.doc.commit();
+                return Ok(len - i);
+            }
+        }
+        Ok(0)
+    }
+
+    /// The transcript was rewound: the agent's provider session was dropped,
+    /// so the next fresh session is owed what is left of the conversation.
+    pub fn rewound(&self) -> bool {
+        matches!(
+            self.doc.get_map("meta").get("rewound"),
+            Some(loro::ValueOrContainer::Value(LoroValue::Bool(true)))
+        )
+    }
+
+    pub fn set_rewound(&self) -> Result<(), DocError> {
+        if !self.rewound() {
+            self.doc.get_map("meta").insert("rewound", true)?;
+            self.doc.commit();
+        }
+        Ok(())
+    }
+
     /// Stamp a terminal status on an existing message entry by id (recovery:
     /// abandoned `streaming` entries from a dead run are stamped `aborted`).
     /// Returns `false` when no entry with that id exists.
@@ -1434,6 +1473,44 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].role, MessageRole::System);
         assert_eq!(entries[0].parts, vec![seam]);
+    }
+
+    #[test]
+    fn truncate_from_drops_the_entry_and_everything_after() {
+        let doc = SessionDoc::init("rewind").unwrap();
+        for (id, role) in [
+            ("u1", MessageRole::User),
+            ("a1", MessageRole::Assistant),
+            ("u2", MessageRole::User),
+            ("a2", MessageRole::Assistant),
+        ] {
+            doc.push_message(&SessionMessageEntry {
+                duration_ms: None,
+                id: id.into(),
+                role,
+                parts: vec![MessagePart::Text {
+                    id: format!("{id}-p"),
+                    text: id.into(),
+                }],
+                created_at: 1,
+                device_id: "dev".into(),
+                status: Some(MessageStatus::Complete),
+                continuation_of: None,
+            })
+            .unwrap();
+        }
+        assert_eq!(doc.truncate_from("missing").unwrap(), 0);
+        assert_eq!(doc.truncate_from("u2").unwrap(), 2);
+        let ids: Vec<_> = doc
+            .read_entries()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(ids, ["u1", "a1"]);
+        assert!(!doc.rewound());
+        doc.set_rewound().unwrap();
+        assert!(doc.rewound());
     }
     use zeron_proto::{AgentEvent, ToolCall};
 
