@@ -77,6 +77,11 @@ It's a *linked* theme: because it points at the copied repo bundle, a future
 
 ## Updating later
 
+- Fork releases published to the homelab edge apply **one-click** from the
+  sidebar update strip (or `zeron update`) — same stage + swap + service
+  restart as stock, but into `~/.zeron/app/fork-<version>/` with the fork
+  marker kept. A *stock* release offered to a fork install stays advisory
+  (`run zeron-fork-update`) so it can't clobber the fork.
 - On the fork's home PC: `zeron-fork-update` rebases the fork onto the next official release and rebuilds.
 - On other machines, re-run `./scripts/install-desktop.sh` (it pulls `main`, rebuilds only if the build changed, and swaps the binary).
 - Never run stock `zeron update` while the fork is installed — the fork's guard refuses with a pointer to `zeron-fork-update` (see FORK.md).
