@@ -4,7 +4,7 @@
 //! are report-only.
 
 use anyhow::bail;
-use zeron_update::{InstallKind, current_version, version_newer};
+use zeron_update::{InstallKind, current_version, is_fork_version, version_newer};
 
 /// `--check` prints the verdict and exits (nonzero when an update is available,
 /// so scripts can gate on it).
@@ -21,7 +21,7 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
     }
     println!("zeron {current} → {} available", manifest.version);
     if check_only {
-        if fork {
+        if fork && !is_fork_version(&manifest.version) {
             println!(
                 "note: forked build ({current}) — official {} won't overwrite it. To take the release with fork patches, run `zeron-fork-update`.",
                 manifest.version
@@ -29,7 +29,10 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
         }
         std::process::exit(1);
     }
-    if fork {
+    // A fork install may one-click apply fork releases (same `-mael.N`
+    // lineage — staging is fork-aware); a stock release would overwrite the
+    // fork, so that still refuses.
+    if fork && !is_fork_version(&manifest.version) {
         bail!(
             "this is the mael fork ({current}); `zeron update` would overwrite it with stock {}.\nTo take the official release while keeping the fork patches, run `zeron-fork-update` instead — it rebases onto {} and rebuilds.",
             manifest.version,
@@ -47,7 +50,9 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
             zeron_update::apply_headless(&app_root, &manifest.version)?;
             println!(
                 "installed {} (current → {})",
-                app_root.join(&manifest.version).display(),
+                app_root
+                    .join(zeron_update::versioned_dir_name(&manifest.version))
+                    .display(),
                 manifest.version
             );
             match zeron_update::restart_service() {

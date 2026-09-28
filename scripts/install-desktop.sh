@@ -121,6 +121,48 @@ ln -sf "$HOME/.zeron/app/current/zeron" "$HOME/.local/bin/zeron"
 cp "$CLONE_DIR/scripts/zeron-fork-update.sh" "$HOME/.local/bin/zeron-fork-update"
 chmod +x "$HOME/.local/bin/zeron-fork-update"
 
+say "desktop entry + icon"
+mkdir -p "$HOME/.local/share/applications" \
+    "$HOME/.local/share/icons/hicolor/1024x1024/apps" \
+    "$HOME/.local/share/icons/hicolor/scalable/apps"
+# Absolute Exec: krunner has no ~/.local/bin on PATH, so a bare `zeron`
+# never resolves from the launcher.
+cat > "$HOME/.local/share/applications/zeron.desktop" <<ENTRY
+[Desktop Entry]
+Type=Application
+Name=Zeron
+GenericName=Coding Agent Controller
+Comment=mael fork — droid + selfhost
+Exec=$HOME/.zeron/app/current/zeron %u
+TryExec=$HOME/.zeron/app/current/zeron
+# Absolute Icon: Qt/Vicinae ignores hicolor dirs with no index.theme, so a
+# themed Icon=zeron is unreliable — point straight at the file instead.
+Icon=$HOME/.local/share/icons/hicolor/512x512/apps/zeron.png
+Terminal=false
+Categories=Development;
+Keywords=agent;droid;claude;codex;ai;coding;
+StartupWMClass=zeron
+MimeType=x-scheme-handler/zeron;
+ENTRY
+# NOTE: no index.theme lists 1024x1024/apps, so a 1024-only install is
+# invisible to Gtk/Vicinae icon lookups — install the same png at every
+# standard size (Gtk scales on load, exact pixels don't matter here).
+for size in 1024 512 256 128 64 48 32; do
+    install -Dm644 "$CLONE_DIR/dist/zeron.png" \
+        "$HOME/.local/share/icons/hicolor/${size}x${size}/apps/zeron.png"
+done
+# Qt (Vicinae) skips icon dirs with no index.theme — the stock hicolor one
+# covers all sizes installed above.
+[ -f "$HOME/.local/share/icons/hicolor/index.theme" ] || install -Dm644 \
+    /usr/share/icons/hicolor/index.theme \
+    "$HOME/.local/share/icons/hicolor/index.theme"
+command -v update-desktop-database >/dev/null 2>&1 \
+    && update-desktop-database "$HOME/.local/share/applications" || true
+command -v gtk-update-icon-cache >/dev/null 2>&1 \
+    && gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" >/dev/null 2>&1 || true
+command -v kbuildsycoca6 >/dev/null 2>&1 \
+    && kbuildsycoca6 --noincremental >/dev/null 2>&1 || true
+
 say "theme bundle (BlackViolet, from Noctalia palette)"
 THEME_DIR="$HOME/.config/zeron-themes"
 mkdir -p "$THEME_DIR"

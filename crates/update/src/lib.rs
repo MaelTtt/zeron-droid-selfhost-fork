@@ -120,12 +120,14 @@ pub fn mac_app_artifact(version: &str) -> String {
 }
 
 /// Strictly-newer dotted-numeric compare (`0.1.10` > `0.1.9` > `0.1.1`).
-/// A `-suffix`/`+suffix` (e.g. the mael fork's `-mael.1`) is stripped before
-/// comparing, so `0.2.91` counts as newer than `0.2.86-mael.1` — while equal
-/// numeric cores never count as newer either way, so a fork at the same base
-/// as the official release is not nagged into "updating" to stock and losing
-/// its patches. Unparseable versions never count as newer — a garbage
-/// `latest.txt` must not trigger an update loop.
+/// A `-suffix`/`+suffix` is stripped before comparing cores, so `0.2.91`
+/// counts as newer than `0.2.86-mael.1` — while equal numeric cores never
+/// count as newer from a suffix alone, EXCEPT a fork iterating on its own
+/// `-mael.N` suffix (`0.2.96-mael.2` > `0.2.96-mael.1`): that is how
+/// one-click fork releases are discovered. A fork at the same base is still
+/// never nagged toward stock (`0.2.91` vs `0.2.91-mael.1`), and stock is
+/// never nagged toward a fork suffix either. Unparseable versions never
+/// count as newer — a garbage `latest.txt` must not trigger an update loop.
 pub fn version_newer(latest: &str, current: &str) -> bool {
     fn core(v: &str) -> &str {
         let v = v.trim().trim_start_matches('v');
@@ -141,10 +143,38 @@ pub fn version_newer(latest: &str, current: &str) -> bool {
             .collect::<Option<_>>()?;
         (!nums.is_empty()).then_some(nums)
     }
+    /// The `N` in a `-mael.N` suffix, else 0 (stock or other suffixes).
+    fn mael_num(v: &str) -> u64 {
+        let v = v.trim().trim_start_matches('v');
+        v.split_once('-')
+            .and_then(|(_, s)| s.strip_prefix("mael."))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0)
+    }
     match (parts(latest), parts(current)) {
-        (Some(l), Some(c)) => l > c,
+        (Some(l), Some(c)) => {
+            if l != c {
+                return l > c;
+            }
+            mael_num(current) > 0 && mael_num(latest) > mael_num(current)
+        }
         _ => false,
     }
+}
+
+/// A `-mael.N` release tag — the only versions a fork install may one-click
+/// apply. A stock version would overwrite the fork, so those stay advisory
+/// (`zeron-fork-update`); the suffix is proof of fork origin, since stock
+/// never publishes one.
+pub fn is_fork_version(version: &str) -> bool {
+    mael_suffix_num(version).is_some()
+}
+
+fn mael_suffix_num(version: &str) -> Option<u64> {
+    let v = version.trim().trim_start_matches('v');
+    let (_, suffix) = v.split_once('-')?;
+    let n = suffix.strip_prefix("mael.")?;
+    (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then(|| n.parse().ok())?
 }
 
 /// Fetch the newest release metadata: `manifest.json`, falling back to
@@ -493,6 +523,26 @@ fn run(program: &str, args: &[&str]) -> anyhow::Result<()> {
 // Managed (symlink) installs — the daemon/VPS path
 // ---------------------------------------------------------------------------
 
+/// Install dir for a staged version. Fork installs stage into `fork-<ver>/`
+/// (mirroring scripts/install-desktop.sh) so stock and fork builds never
+/// share a directory; stock keeps the bare `<ver>/` layout.
+pub fn versioned_dir_name(version: &str) -> String {
+    versioned_dir_name_for(version, is_fork_install())
+}
+
+fn versioned_dir_name_for(version: &str, fork: bool) -> String {
+    if fork {
+        format!("fork-{version}")
+    } else {
+        version.to_string()
+    }
+}
+
+/// Marker content identifying a fork install dir (same text the desktop
+/// install script writes — `is_fork_install` looks for the file, not the
+/// text, but keep them identical anyway).
+const FORK_MARKER_TEXT: &str = "mael fork — see docs/INSTALL-DESKTOP.md\n";
+
 /// Download + unpack the headless tarball into `app_root/<ver>` (idempotent —
 /// an already-staged version is reused). Returns the versioned dir.
 pub async fn stage_headless(
@@ -500,10 +550,19 @@ pub async fn stage_headless(
     manifest: &Manifest,
     app_root: &Path,
 ) -> anyhow::Result<PathBuf> {
+    stage_headless_for(edge_url, manifest, app_root, is_fork_install()).await
+}
+
+async fn stage_headless_for(
+    edge_url: &str,
+    manifest: &Manifest,
+    app_root: &Path,
+    fork: bool,
+) -> anyhow::Result<PathBuf> {
     // Reject unsupported targets before creating a stage or making a request.
     require_managed_update_platform()?;
     let version = &manifest.version;
-    let dest = app_root.join(version);
+    let dest = app_root.join(versioned_dir_name_for(version, fork));
     if dest.join("zeron").exists() {
         return Ok(dest);
     }
@@ -539,6 +598,12 @@ pub async fn stage_headless(
                 return Err(err).with_context(|| format!("moving {} into place", dest.display()));
             }
         }
+        if fork {
+            // A fork install dir must carry the marker `is_fork_install`
+            // looks for, or the next update would misread it as stock.
+            std::fs::write(dest.join(".mael-fork"), FORK_MARKER_TEXT)
+                .with_context(|| format!("writing fork marker in {}", dest.display()))?;
+        }
         Ok(dest.clone())
     }
     .await;
@@ -546,12 +611,17 @@ pub async fn stage_headless(
     result
 }
 
-/// Atomically repoint `app_root/current` at `app_root/<ver>` (symlink to a temp
-/// name, then rename over — never a window with no `current`).
+/// Atomically repoint `app_root/current` at the staged version dir
+/// (`app_root/<ver>`, `app_root/fork-<ver>` on fork installs): symlink to a
+/// temp name, then rename over — never a window with no `current`.
 pub fn apply_headless(app_root: &Path, version: &str) -> anyhow::Result<()> {
+    apply_headless_for(app_root, version, is_fork_install())
+}
+
+fn apply_headless_for(app_root: &Path, version: &str, fork: bool) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
-        let target = app_root.join(version);
+        let target = app_root.join(versioned_dir_name_for(version, fork));
         if !target.join("zeron").exists() {
             bail!("{} is not a staged install", target.display());
         }
@@ -559,6 +629,9 @@ pub fn apply_headless(app_root: &Path, version: &str) -> anyhow::Result<()> {
         let _ = std::fs::remove_file(&tmp);
         std::os::unix::fs::symlink(&target, &tmp).context("creating current symlink")?;
         std::fs::rename(&tmp, app_root.join("current")).context("swapping current symlink")?;
+        if fork {
+            prune_old_fork_installs(app_root, &target);
+        }
         Ok(())
     }
     #[cfg(not(unix))]
@@ -566,6 +639,36 @@ pub fn apply_headless(app_root: &Path, version: &str) -> anyhow::Result<()> {
         let _ = (app_root, version);
         require_managed_update_platform()?;
         unreachable!("supported managed-update platforms are Unix")
+    }
+}
+
+/// Drop older `fork-*` install dirs after a successful swap, keeping the
+/// just-applied target plus the newest spare (mirrors the desktop install
+/// script). Never touches stock `<ver>` dirs, non-directories, dirs without
+/// a binary, or the dir the current process runs from.
+fn prune_old_fork_installs(app_root: &Path, target: &Path) {
+    let running_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()));
+    let Ok(entries) = std::fs::read_dir(app_root) else {
+        return;
+    };
+    let mut spares: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir()
+                && p != target
+                && running_dir.as_ref().is_none_or(|r| p != r)
+                && p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("fork-"))
+                && p.join("zeron").exists()
+        })
+        .collect();
+    // Lexicographic order approximates version order for `fork-<ver>` names.
+    spares.sort();
+    for old in spares.into_iter().rev().skip(1) {
+        let _ = std::fs::remove_dir_all(&old);
     }
 }
 
@@ -1191,6 +1294,34 @@ mod tests {
         assert!(version_newer("0.2.91", "0.2.86-mael.1"));
         assert!(!version_newer("0.2.91", "0.2.91-mael.1"));
         assert!(!version_newer("0.2.91-mael.1", "0.2.91"));
+        // ...except a fork iterating on its own suffix: that is how
+        // one-click fork releases are discovered (numeric, not lexical).
+        assert!(version_newer("0.2.96-mael.2", "0.2.96-mael.1"));
+        assert!(version_newer("0.2.96-mael.10", "0.2.96-mael.2"));
+        assert!(!version_newer("0.2.96-mael.1", "0.2.96-mael.2"));
+        assert!(!version_newer("0.2.96-mael.1", "0.2.96-mael.1"));
+        // A newer numeric core still wins regardless of suffix.
+        assert!(version_newer("0.2.97-mael.1", "0.2.96-mael.9"));
+    }
+
+    #[test]
+    fn fork_version_detection() {
+        assert!(is_fork_version("0.2.96-mael.1"));
+        assert!(is_fork_version("v0.2.96-mael.12"));
+        assert!(!is_fork_version("0.2.96"));
+        assert!(!is_fork_version("0.2.96-beta.1"));
+        assert!(!is_fork_version("0.2.96-mael."));
+        assert!(!is_fork_version("0.2.96-mael.x"));
+        assert!(!is_fork_version("nightly"));
+    }
+
+    #[test]
+    fn fork_installs_stage_into_fork_prefixed_dirs() {
+        assert_eq!(versioned_dir_name_for("0.2.91", false), "0.2.91");
+        assert_eq!(
+            versioned_dir_name_for("0.2.96-mael.2", true),
+            "fork-0.2.96-mael.2"
+        );
     }
 
     #[test]
@@ -1328,18 +1459,74 @@ mod tests {
             std::fs::create_dir_all(app_root.join(ver)).unwrap();
             std::fs::write(app_root.join(ver).join("zeron"), ver).unwrap();
         }
-        apply_headless(&app_root, "0.1.0").unwrap();
+        apply_headless_for(&app_root, "0.1.0", false).unwrap();
         assert_eq!(
             std::fs::read_link(app_root.join("current")).unwrap(),
             app_root.join("0.1.0")
         );
         // Swap over an existing symlink.
-        apply_headless(&app_root, "0.1.1").unwrap();
+        apply_headless_for(&app_root, "0.1.1", false).unwrap();
         assert_eq!(
             std::fs::read_link(app_root.join("current")).unwrap(),
             app_root.join("0.1.1")
         );
         // Unstaged version refuses.
-        assert!(apply_headless(&app_root, "0.2.0").is_err());
+        assert!(apply_headless_for(&app_root, "0.2.0", false).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fork_symlink_swap_targets_fork_prefixed_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_root = tmp.path().join("app");
+        for ver in ["fork-0.2.96-mael.1", "fork-0.2.96-mael.2"] {
+            std::fs::create_dir_all(app_root.join(ver)).unwrap();
+            std::fs::write(app_root.join(ver).join("zeron"), ver).unwrap();
+        }
+        apply_headless_for(&app_root, "0.2.96-mael.1", true).unwrap();
+        assert_eq!(
+            std::fs::read_link(app_root.join("current")).unwrap(),
+            app_root.join("fork-0.2.96-mael.1")
+        );
+        // Swap prunes down to target + newest spare.
+        apply_headless_for(&app_root, "0.2.96-mael.2", true).unwrap();
+        assert_eq!(
+            std::fs::read_link(app_root.join("current")).unwrap(),
+            app_root.join("fork-0.2.96-mael.2")
+        );
+        assert!(app_root.join("fork-0.2.96-mael.1").exists());
+        // A bare (stock-layout) dir name never resolves on the fork path.
+        assert!(apply_headless_for(&app_root, "0.2.96-mael.2", false).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fork_prune_keeps_target_plus_newest_spare() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_root = tmp.path();
+        for ver in [
+            "fork-0.2.94-mael.1",
+            "fork-0.2.95-mael.1",
+            "fork-0.2.96-mael.1",
+            "fork-0.2.96-mael.2",
+        ] {
+            std::fs::create_dir_all(app_root.join(ver)).unwrap();
+            std::fs::write(app_root.join(ver).join("zeron"), ver).unwrap();
+        }
+        // A stock dir and a stray file must survive.
+        std::fs::create_dir_all(app_root.join("0.2.96")).unwrap();
+        std::fs::write(app_root.join("0.2.96").join("zeron"), "stock").unwrap();
+        std::fs::write(app_root.join("notes.txt"), "x").unwrap();
+        let target = app_root.join("fork-0.2.96-mael.2");
+        prune_old_fork_installs(app_root, &target);
+        assert!(target.exists());
+        assert!(
+            app_root.join("fork-0.2.96-mael.1").exists(),
+            "newest spare kept"
+        );
+        assert!(!app_root.join("fork-0.2.95-mael.1").exists());
+        assert!(!app_root.join("fork-0.2.94-mael.1").exists());
+        assert!(app_root.join("0.2.96").exists(), "stock dirs untouched");
+        assert!(app_root.join("notes.txt").exists());
     }
 }

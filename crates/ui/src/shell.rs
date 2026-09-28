@@ -3819,6 +3819,11 @@ impl Shell {
                 };
                 self.rewind_to(prompt, cx);
             }
+            TranscriptEvent::TextSelected => {
+                // Callers have no `Window`; focus lands on the next frame.
+                self.composer_focus_pending = true;
+                cx.notify();
+            }
         }
     }
 
@@ -8152,9 +8157,10 @@ impl Shell {
     /// The update strip's label and click affordance per install kind. Desktop
     /// update installs (macOS bundles, Windows portable packages) drive their
     /// flow from the strip; managed installs apply the headless release from
-    /// the strip too (`ApplyUpdate`: stage + swap + service restart) — except
-    /// a fork build, which a stock release would overwrite, so it only points
-    /// at `zeron-fork-update`; unmanaged installs (source builds,
+    /// the strip too (`ApplyUpdate`: stage + swap + service restart) — including
+    /// a fork build offered a fork (`-mael.N`) release, which stages
+    /// fork-aware. A fork build offered stock would be overwritten, so it only
+    /// points at `zeron-fork-update`; unmanaged installs (source builds,
     /// hand-copied binaries) are pointed at the GitHub releases page.
     fn update_strip_label(
         install: &zeron_update::InstallKind,
@@ -8171,7 +8177,7 @@ impl Shell {
                 UpdateFlow::Failed(message) => (format!("Update failed: {message}").into(), true),
             }
         } else if matches!(install, zeron_update::InstallKind::Managed { .. }) {
-            if fork {
+            if fork && !zeron_update::is_fork_version(latest) {
                 (
                     format!("Update available — v{latest} · run `zeron-fork-update`").into(),
                     true,
@@ -8198,15 +8204,29 @@ impl Shell {
 
     /// Idle → download; Ready → swap + relaunch; Failed → retry; managed
     /// installs → the engine's `ApplyUpdate` (stages the headless release,
-    /// swaps it, restarts the service); advisory installs (a fork build:
-    /// `zeron-fork-update`, unmanaged: the GitHub releases page) → open the
-    /// destination if there is one, then dismiss for this version.
+    /// swaps it, restarts the service); advisory installs (a fork build
+    /// offered stock: `zeron-fork-update`, unmanaged: the GitHub releases
+    /// page) → open the destination if there is one, then dismiss for this
+    /// version.
     fn on_update_strip_click(&mut self, cx: &mut Context<Self>) {
-        // Managed stock installs: the engine updates itself in place. The
-        // strip waits on the RPC (stage + swap + service restart — the reply
-        // flushes before systemd kills the process), then hides: the fresh
-        // engine reports up to date when it rejoins.
-        if matches!(self.install, zeron_update::InstallKind::Managed { .. }) && !self.fork {
+        // Managed installs (stock, or a fork build offered a `-mael.N`
+        // release, which stages fork-aware): the engine updates itself in
+        // place. A fork build offered stock stays advisory — applying it
+        // would overwrite the fork. The strip waits on the RPC (stage + swap
+        // + service restart — the reply flushes before systemd kills the
+        // process), then hides: the fresh engine reports up to date when it
+        // rejoins.
+        let fork_apply = self.fork
+            && self
+                .state
+                .read(cx)
+                .update
+                .as_ref()
+                .and_then(|s| s.latest_version.as_deref())
+                .is_some_and(zeron_update::is_fork_version);
+        if matches!(self.install, zeron_update::InstallKind::Managed { .. })
+            && (!self.fork || fork_apply)
+        {
             if matches!(self.update_flow, UpdateFlow::Applying) {
                 return;
             }
@@ -13023,6 +13043,15 @@ mod tests {
             SharedString::from("Update available — v0.2.86 · run `zeron-fork-update`")
         );
         assert!(fork.1);
+        // Managed, fork build offered a `-mael.N` release: one-click apply,
+        // like stock managed (staging is fork-aware).
+        let fork_release =
+            Shell::update_strip_label(&managed, &UpdateFlow::Idle, "0.2.96-mael.2", true);
+        assert_eq!(
+            fork_release.0,
+            SharedString::from("Update available — v0.2.96-mael.2 · click to update")
+        );
+        assert!(fork_release.1);
         // Unmanaged (source builds, hand-copied binaries — bare Windows
         // release exes): the GitHub releases page, clickable to open it.
         let unmanaged = Shell::update_strip_label(
