@@ -3344,6 +3344,12 @@ pub enum TranscriptEvent {
     /// The rewind action on a sent user message: put that prompt back in
     /// the composer. `entry_id` is the user message entry.
     RewindTo { entry_id: String },
+    /// A markdown text selection completed via mouse. The completing press
+    /// blurred whatever input had focus (click-away blur) and transcript
+    /// text is not focusable, so without restoring focus Ctrl+C has no
+    /// responder. Shell refocuses the session composer, whose Copy falls
+    /// back to the global markdown selection.
+    TextSelected,
 }
 
 impl gpui::EventEmitter<TranscriptEvent> for Transcript {}
@@ -3937,6 +3943,16 @@ impl Transcript {
             // anchor row has virtualized away and cannot receive mouse-up.
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             cx.write_to_primary(ClipboardItem::new_string(_text));
+        }
+        // A completed drag blurred the composer (click-away) and transcript
+        // text cannot take focus — restore it so Ctrl+C reaches Copy (which
+        // falls back to this selection). `selected_text` is read instead of
+        // the `end_active_drag` return because the anchor element's own
+        // mouse-up listener usually ends the drag first; either way the
+        // spans persist for the copy. A bare click leaves no spans, so
+        // click-away blur still applies to it.
+        if was_selecting && crate::markdown::selection::selected_text().is_some() {
+            cx.emit(TranscriptEvent::TextSelected);
         }
         if was_selecting {
             self.last_scroll_distance = self.distance_from_bottom();
@@ -12788,6 +12804,80 @@ mod tests {
                 });
                 draw(window, cx);
                 assert_eq!(crate::markdown::selection::selected_text(), Some(selected));
+                crate::markdown::selection::clear_if_owner("reply#text.0:0");
+            });
+        }
+
+        #[test]
+        fn completing_a_text_selection_emits_text_selected_for_focus_restore() {
+            with_window(|transcript, window, cx| {
+                transcript.update(cx, |this, cx| {
+                    feed(
+                        this,
+                        vec![
+                            prompt("prompt"),
+                            assistant(
+                                "reply",
+                                MessageStatus::Complete,
+                                vec![text_part("text", "Selectable response text.")],
+                            ),
+                        ],
+                        cx,
+                    );
+                    this.rail_enabled = false;
+                });
+                draw(window, cx);
+                let restored = Rc::new(RefCell::new(false));
+                let _events = cx.subscribe(&transcript, {
+                    let restored = restored.clone();
+                    move |_, event: &TranscriptEvent, _| {
+                        if matches!(event, TranscriptEvent::TextSelected) {
+                            *restored.borrow_mut() = true;
+                        }
+                    }
+                });
+                let bounds = render::selection_test_bounds("reply#text.0:0");
+                let start = bounds.origin + gpui::point(px(1.0), px(8.0));
+                let end = start + gpui::point(px(90.0), px(0.0));
+                cx.update_window(window.into(), |_, window, cx| {
+                    window.dispatch_event(
+                        gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                            button: MouseButton::Left,
+                            position: start,
+                            click_count: 1,
+                            ..Default::default()
+                        }),
+                        cx,
+                    );
+                })
+                .unwrap();
+                assert!(crate::markdown::selection::is_dragging());
+                draw(window, cx);
+                for event in [
+                    gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                        position: end,
+                        pressed_button: Some(MouseButton::Left),
+                        ..Default::default()
+                    }),
+                    gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                        button: MouseButton::Left,
+                        position: end,
+                        ..Default::default()
+                    }),
+                ] {
+                    cx.update_window(window.into(), |_, window, cx| {
+                        window.dispatch_event(event, cx);
+                    })
+                    .unwrap();
+                }
+                assert!(
+                    crate::markdown::selection::selected_text().is_some(),
+                    "drag must leave a selection to copy"
+                );
+                assert!(
+                    *restored.borrow(),
+                    "completing a selection must emit TextSelected so the shell restores composer focus (Ctrl+C)"
+                );
                 crate::markdown::selection::clear_if_owner("reply#text.0:0");
             });
         }
