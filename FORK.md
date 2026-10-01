@@ -14,7 +14,7 @@ releases.
 | ba470911 | **Fork identity** — version `0.2.96-mael.2`; `zeron update` refuses to overwrite the fork with *stock* while `ZERON_FORK` is set (points at `zeron-fork-update`), but one-click applies `-mael.N` releases from the fork feed (fork-aware staging into `fork-<version>/`); background auto-update disabled; `zeron status` shows the fork line | mael |
 | — | **Rewind** — rewind button in the hover strip under each sent message (click twice to confirm) plus double-Escape prompt list. For Droid and OpenCode chats it truncates the transcript from that message and drops the agent's session (`RewindChat` RPC); the next run starts a fresh session bootstrapped with the remaining transcript. Files are not reverted. Other harnesses only get the prompt text back | upstream PR #384 + mael |
 | 0502fe67 | 0.2.86 surface adaptation of the droid harness (install methods, skills dirs, spec fields, registry descriptor, auth test API) | mael |
-| 1f691a9c | **One-click update strip + droid fallback chip** — managed installs apply headless releases from the sidebar strip (`ApplyUpdate`: stage + swap + service restart, with updating/failed states); a fork build applies `-mael.N` releases from the fork feed the same way (fork-aware staging) and shows the `zeron-fork-update` advisory only for *stock* releases (which would clobber the fork); ACP `config_option_update` model changes surface as an amber "Model switched" transcript chip (Droid's quota fallback onto its core models) | mael |
+| 1f691a9c | **One-click update strip + droid fallback chip** — managed installs apply headless releases from the sidebar strip (`ApplyUpdate`: stage + swap + service restart, with updating/failed states); a fork build applies `-mael.N` releases from the fork feed the same way (fork-aware staging) and opens a fresh session with the rebase runbook prefilled for *stock* releases (which would clobber the fork); ACP `config_option_update` model changes surface as an amber "Model switched" transcript chip (Droid's quota fallback onto its core models) | mael |
 
 Skipped on purpose: the PR's "Permission trait to every harness" commit (`ae4d39d1`) —
 upstream gained its own `crates/harness/src/permission.rs` in 0.2.86 that supersedes it.
@@ -60,9 +60,10 @@ What the client does on click (`ApplyUpdate` RPC): downloads the tarball,
 verifies sha256 against the manifest, unpacks into `~/.zeron/app/fork-<ver>/`
 with the `.mael-fork` marker, atomically repoints `current`, prunes older
 fork dirs (keeps the newest spare), and restarts `zeron.service`. A fork
-install offered a *stock* version still gets the advisory strip
-(`run zeron-fork-update`) — the `-mael.N` suffix is the proof of fork
-origin, and stock never publishes one.
+install offered a *stock* version opens a fresh session with the rebase
+runbook prefilled in the composer (not sent) — the user's own agent does
+the rebase + rebuild + install per the runbook below. The `-mael.N` suffix
+is the proof of fork origin, and stock never publishes one.
 
 ## Taking an official release (low-friction path)
 
