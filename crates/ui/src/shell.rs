@@ -8149,7 +8149,9 @@ impl Shell {
             strip = strip
                 .cursor_pointer()
                 .hover(move |s| s.bg(chip_bg_hover))
-                .on_click(cx.listener(move |this, _, _, cx| this.on_update_strip_click(cx)));
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.on_update_strip_click(window, cx)
+                }));
         }
         Some(strip.into_any_element())
     }
@@ -8159,9 +8161,10 @@ impl Shell {
     /// flow from the strip; managed installs apply the headless release from
     /// the strip too (`ApplyUpdate`: stage + swap + service restart) — including
     /// a fork build offered a fork (`-mael.N`) release, which stages
-    /// fork-aware. A fork build offered stock would be overwritten, so it only
-    /// points at `zeron-fork-update`; unmanaged installs (source builds,
-    /// hand-copied binaries) are pointed at the GitHub releases page.
+    /// fork-aware. A fork build offered stock would be overwritten, so its
+    /// strip drafts a rebase session instead (see `open_fork_rebase_session`);
+    /// unmanaged installs (source builds, hand-copied binaries) are pointed
+    /// at the GitHub releases page.
     fn update_strip_label(
         install: &zeron_update::InstallKind,
         flow: &UpdateFlow,
@@ -8179,7 +8182,8 @@ impl Shell {
         } else if matches!(install, zeron_update::InstallKind::Managed { .. }) {
             if fork && !zeron_update::is_fork_version(latest) {
                 (
-                    format!("Update available — v{latest} · run `zeron-fork-update`").into(),
+                    format!("Update available — v{latest} · click to draft update session")
+                        .into(),
                     true,
                 )
             } else {
@@ -8204,15 +8208,30 @@ impl Shell {
 
     /// Idle → download; Ready → swap + relaunch; Failed → retry; managed
     /// installs → the engine's `ApplyUpdate` (stages the headless release,
-    /// swaps it, restarts the service); advisory installs (a fork build
-    /// offered stock: `zeron-fork-update`, unmanaged: the GitHub releases
-    /// page) → open the destination if there is one, then dismiss for this
-    /// version.
-    fn on_update_strip_click(&mut self, cx: &mut Context<Self>) {
+    /// swaps it, restarts the service); a fork build offered stock opens a
+    /// rebase session instead (applying stock would overwrite the fork);
+    /// unmanaged installs → the GitHub releases page. Advisory paths dismiss
+    /// the strip for this version.
+    fn on_update_strip_click(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A fork build offered stock: applying it would clobber the fork, so
+        // the strip drafts the rebase work as a new session instead — the
+        // user's own agent rebases, rebuilds, and reinstalls (see FORK.md).
+        if self.fork
+            && self
+                .state
+                .read(cx)
+                .update
+                .as_ref()
+                .and_then(|s| s.latest_version.as_deref())
+                .is_some_and(|v| !zeron_update::is_fork_version(v))
+        {
+            self.open_fork_rebase_session(window, cx);
+            return;
+        }
         // Managed installs (stock, or a fork build offered a `-mael.N`
         // release, which stages fork-aware): the engine updates itself in
-        // place. A fork build offered stock stays advisory — applying it
-        // would overwrite the fork. The strip waits on the RPC (stage + swap
+        // place. A fork build offered stock returns above with a rebase
+        // session. The strip waits on the RPC (stage + swap
         // + service restart — the reply flushes before systemd kills the
         // process), then hides: the fresh engine reports up to date when it
         // rejoins.
@@ -8288,6 +8307,62 @@ impl Shell {
             }
             UpdateFlow::Ready(staged) => self.apply_staged_update(staged, cx),
         }
+    }
+
+    /// Fork build offered a stock release: open a fresh session with the
+    /// fork-rebase runbook prefilled in the composer (not sent — the user
+    /// reviews, picks their harness, and sends). The agent does the
+    /// `zeron-fork-update` rebase + rebuild + install per FORK.md.
+    fn open_fork_rebase_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let latest = self
+            .state
+            .read(cx)
+            .update
+            .as_ref()
+            .and_then(|s| s.latest_version.clone())
+            .unwrap_or_default();
+        self.open_new_session(cx);
+        let prompt = Self::fork_rebase_prompt(&latest);
+        self.composer.update(cx, |composer, cx| {
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text(prompt, cx));
+        });
+        self.update_dismissed = if latest.is_empty() {
+            None
+        } else {
+            Some(latest)
+        };
+        window.focus(&self.composer.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    /// Premade prompt for the fork-update session: all the context an agent
+    /// needs to rebase the mael fork onto a stock upstream release, rebuild,
+    /// and reinstall — without the user re-explaining the fork layout.
+    fn fork_rebase_prompt(latest: &str) -> String {
+        let current = zeron_update::current_version();
+        let target = latest.trim().trim_start_matches('v');
+        format!(
+            "Update my mael fork of Zeron to the official upstream release v{target}.\n\
+            \n\
+            Context:\n\
+            - This app is itself the fork, currently version {current} (a `-mael.N` build).\n\
+            - The fork clone lives at ~/.build/zeron, branch `main` (tracks the mael fork on GitHub).\n\
+            - Upstream is https://github.com/zeronsh/zeron.git (remote `origin`; if a remote named `upstream` is missing, add it).\n\
+            - The full runbook is FORK.md in the repo root — follow it, especially the version rules and known conflict spots.\n\
+            \n\
+            Do the work:\n\
+            1. Fetch upstream tags and rebase the fork commits (everything on `main` past the upstream merge-base) onto v{target}, keeping the fork patches (droid harness, selfhost edge, fork identity).\n\
+            2. If the rebase conflicts, resolve the markers (known spots: workspace version in Cargo.toml, crates/harness/src/acp/mod.rs, crates/ui/src/settings/harnesses.rs, README harness lists) and continue — abort safely rather than shipping conflict markers.\n\
+            3. Bump the workspace version to `<upstream>-mael.<n>` (must be NEWER than both v{target} and {current} per the dotted-numeric compare — e.g. v{target} becomes {target}-mael.1, or bump N if that version exists).\n\
+            4. Rebuild in release mode: `cargo build --release -p zeron` (takes ~10 min; needs ~8 GB free under ~/.build/zeron/target).\n\
+            5. Install fork-aware: copy the binary to ~/.zeron/app/fork-<version>/zeron with the `.mael-fork` marker file, repoint the ~/.zeron/app/current symlink, relink ~/.local/bin/zeron, and refresh ~/.local/bin/zeron-fork-update from scripts/zeron-fork-update.sh. Never overwrite the binary in place while it runs. (`scripts/zeron-fork-update.sh v{target}` automates steps 1–5 — prefer it when it applies.)\n\
+            6. Tag `mael/v<version>` on the result.\n\
+            7. Verify with `~/.zeron/app/current/zeron --version` and `zeron status`. If this desktop app is running its own engine, skip the `zeron.service` restart (it would fail on the engine lock) and tell me to restart the desktop app instead.\n\
+            \n\
+            Do not push to GitHub unless I explicitly ask."
+        )
     }
 
     /// Fetch the manifest and stage the new Zeron desktop bundle under the data dir
@@ -13036,13 +13111,22 @@ mod tests {
             !Shell::update_strip_label(&managed, &UpdateFlow::Applying, "0.2.86", false).1
         );
         // Managed, fork build: applying stock would clobber the fork — the
-        // strip points at the fork's own updater instead.
+        // strip drafts a rebase session instead.
         let fork = Shell::update_strip_label(&managed, &UpdateFlow::Idle, "0.2.86", true);
         assert_eq!(
             fork.0,
-            SharedString::from("Update available — v0.2.86 · run `zeron-fork-update`")
+            SharedString::from("Update available — v0.2.86 · click to draft update session")
         );
         assert!(fork.1);
+        // The drafted prompt carries the target version and the runbook.
+        let prompt = Shell::fork_rebase_prompt("0.2.101");
+        assert!(prompt.contains("v0.2.101"), "prompt names the target");
+        assert!(prompt.contains("FORK.md"), "prompt points at the runbook");
+        assert!(prompt.contains("zeron-fork-update"), "prompt names the helper");
+        assert!(
+            prompt.contains("Do not push"),
+            "prompt withholds pushing by default"
+        );
         // Managed, fork build offered a `-mael.N` release: one-click apply,
         // like stock managed (staging is fork-aware).
         let fork_release =
