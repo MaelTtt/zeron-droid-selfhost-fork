@@ -1,0 +1,11 @@
+# Local build acceleration (fork-only, not upstream).
+#
+# - mold: 3-10x faster links than GNU ld on the multi-GB test/binary links
+#   this workspace produces. Installed per-user (`~/.local/bin/mold`, static
+#   build from rui314/mold releases); `mold --version` must work for this
+#   file to take effect — if it errors, delete the rustflags line below.
+# - sccache is deliberately NOT enabled here: it cannot cache links (our
+#   bottleneck) and it forces CARGO_INCREMENTAL=0, which slows the
+#   edit-check loop this repo lives in. Revisit for multi-branch/CI use.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

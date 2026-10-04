@@ -5,6 +5,7 @@
 //! selected. `UiSettings.open_tabs` is legacy — no longer read or written.
 
 use super::*;
+use crate::state::cli_managed;
 
 const RIGHT_PANE_HEADER_CONTROLS_MIN_WIDTH: f32 = 8.0 + 4.0 + 4.0 + 28.0;
 
