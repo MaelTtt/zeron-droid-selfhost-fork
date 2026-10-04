@@ -852,9 +852,6 @@ impl AppState {
             selected_device: None,
             canvas_target: None,
             selected_chat: None,
-            /// Compact requested from the context-window popup (the footer
-            /// has no Shell handle): the shell picks it up on its next frame
-            /// and opens the compact dialog. One-shot — taking clears it.
             compact_requested: None,
             transcript: Vec::new(),
             queue: Vec::new(),
