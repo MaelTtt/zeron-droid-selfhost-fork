@@ -145,18 +145,22 @@ pub fn mac_app_artifact(version: &str) -> String {
     format!("zeron-{version}-macos-{arch}-app.tar.gz")
 }
 
+fn version_core(v: &str) -> &str {
+    let v = v.trim().trim_start_matches('v').trim_start_matches("fork-");
+    match v.find(['-', '+']) {
+        Some(i) => &v[..i],
+        None => v,
+    }
+}
+
 fn parse_version(v: &str) -> Option<Vec<u64>> {
     // A `-suffix`/`+suffix` (e.g. the mael fork's `-mael.3`) is stripped
     // before comparing, so `0.2.102` counts as newer than `0.2.96-mael.2` —
     // while equal numeric cores never count as newer either way, so a fork
     // at the same base as the official release is not nagged into
-    // "updating" to stock and losing its patches.
-    let core = v.trim().trim_start_matches('v');
-    let core = match core.find(['-', '+']) {
-        Some(i) => &core[..i],
-        None => core,
-    };
-    let nums: Vec<u64> = core
+    // "updating" to stock and losing its patches. `fork-` dir prefixes
+    // (fork install layouts) are stripped the same way.
+    let nums: Vec<u64> = version_core(v)
         .split('.')
         .map(|p| p.parse().ok())
         .collect::<Option<_>>()?;
@@ -612,7 +616,10 @@ pub fn installed_version(kind: &InstallKind) -> Option<String> {
         )?,
         _ => return None,
     };
-    parse_version(&version).map(|_| version)
+    // Fork installs live in `fork-<ver>` dirs — report the bare version so
+    // dotted-numeric compares keep working on them.
+    let version = version.strip_prefix("fork-").unwrap_or(&version);
+    parse_version(version_core(version)).map(|_| version.to_owned())
 }
 
 /// `CFBundleShortVersionString` from an XML property list (the packaging
@@ -767,7 +774,8 @@ async fn stage_headless_for(
         parse_version(version).is_some(),
         "invalid release version {version:?}"
     );
-    let dest = app_root.join(versioned_dir_name_for(version, fork));    if dest.join("zeron").exists() {
+    let dest = app_root.join(versioned_dir_name_for(version, fork));
+    if dest.join("zeron").exists() {
         return Ok(dest);
     }
     let file = headless_artifact(version);
@@ -1122,8 +1130,14 @@ fn auto_update_enabled() -> bool {
 }
 
 /// `ZERON_AUTO_UPDATE=0|false|no` — the desktop app then only reports: no
-/// background download and no install on quit. Unset means on.
+/// background download and no install on quit. Unset means on. A mael-fork
+/// build is always report-only: on Linux a managed install qualifies for the
+/// desktop flow, and background-downloading stock over the fork would clobber
+/// it (the fork's own strip applies `-mael.N` releases instead).
 pub fn desktop_auto_update_enabled() -> bool {
+    if is_fork_install() {
+        return false;
+    }
     std::env::var("ZERON_AUTO_UPDATE")
         .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
         .unwrap_or(true)
@@ -2086,6 +2100,15 @@ mod tests {
         assert_eq!(installed_version(&managed), None, "no current link yet");
         apply_headless(&app_root, "0.4.0").unwrap();
         assert_eq!(installed_version(&managed).as_deref(), Some("0.4.0"));
+
+        // Fork installs live in `fork-<ver>` dirs — the bare version is
+        // reported so dotted-numeric compares keep working on them.
+        std::fs::create_dir_all(app_root.join("fork-0.4.0-mael.1")).unwrap();
+        std::fs::write(app_root.join("fork-0.4.0-mael.1").join("zeron"), "").unwrap();
+        std::fs::remove_file(app_root.join("current")).unwrap();
+        std::os::unix::fs::symlink(app_root.join("fork-0.4.0-mael.1"), app_root.join("current"))
+            .unwrap();
+        assert_eq!(installed_version(&managed).as_deref(), Some("0.4.0-mael.1"));
 
         let bundle = tmp.path().join("Zeron.app");
         std::fs::create_dir_all(bundle.join("Contents")).unwrap();
