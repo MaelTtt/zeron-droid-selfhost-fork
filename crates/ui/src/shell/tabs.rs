@@ -5,6 +5,7 @@
 //! selected. `UiSettings.open_tabs` is legacy — no longer read or written.
 
 use super::*;
+use crate::state::cli_managed;
 
 /// The chat one step from `selected` in the sidebar `order`, wrapping at both
 /// ends. Pure.

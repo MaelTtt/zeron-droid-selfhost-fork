@@ -725,6 +725,9 @@ pub struct AppState {
     /// canvas always reopens where the user left it.
     pub(crate) canvas_target: Option<CanvasTarget>,
     pub selected_chat: Option<String>,
+    /// Compact requested from the context-window popup (the footer has no
+    /// Shell handle) — the chat to open the compact dialog for. One-shot.
+    pub compact_requested: Option<String>,
     /// Boot auto-select happened (or a manual selection superseded it).
     pub auto_selected: bool,
     /// First chats / spaces watch frame has landed — device-local state that
@@ -820,6 +823,12 @@ impl Default for AppState {
     }
 }
 
+/// Harnesses with compact + open-in-terminal support (the titlebar buttons
+/// and the context-window popup entry).
+pub fn cli_managed(harness: HarnessId) -> bool {
+    matches!(harness, HarnessId::Opencode | HarnessId::Droid)
+}
+
 impl AppState {
     pub fn new() -> Self {
         Self {
@@ -843,6 +852,10 @@ impl AppState {
             selected_device: None,
             canvas_target: None,
             selected_chat: None,
+            /// Compact requested from the context-window popup (the footer
+            /// has no Shell handle): the shell picks it up on its next frame
+            /// and opens the compact dialog. One-shot — taking clears it.
+            compact_requested: None,
             transcript: Vec::new(),
             queue: Vec::new(),
             context_usage: None,
@@ -2388,6 +2401,27 @@ impl AppState {
 
     pub fn take_deep_link_notice(&mut self) -> Option<String> {
         self.deep_link_notice.take()
+    }
+
+    /// Queue a compact-dialog request for `chat_id` (context-window popup —
+    /// the footer cannot reach the shell, so the shell picks this up on its
+    /// next frame). Only compactable harnesses are accepted.
+    pub fn request_compact(&mut self, chat_id: &str) -> bool {
+        let compactable = self
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .and_then(|chat| chat.config.as_ref())
+            .is_some_and(|config| cli_managed(config.harness));
+        if compactable {
+            self.compact_requested = Some(chat_id.to_owned());
+        }
+        compactable
+    }
+
+    /// Take a pending [`Self::request_compact`] request, if any.
+    pub fn take_compact_request(&mut self) -> Option<String> {
+        self.compact_requested.take()
     }
 
     /// Select a chat (or clear). Swaps the per-chat doc-transcript subscription:
@@ -5357,5 +5391,58 @@ impl AppState {
             checkout_id: Some(snapshot.checkout_id.clone()),
         };
         self.change_requests.store(key, snapshot);
+    }
+}
+
+
+#[cfg(test)]
+mod compact_request_tests {
+    use super::*;
+
+    fn row(id: &str, harness: Option<HarnessId>) -> Chat {
+        Chat {
+            id: id.into(),
+            device_id: "dev".into(),
+            title: None,
+            archived: false,
+            cwd: None,
+            branch: None,
+            checkout_id: None,
+            source_context: None,
+            config: harness.map(|harness| zeron_proto::ChatConfig {
+                harness,
+                model: None,
+                reasoning: None,
+                model_options: Default::default(),
+                sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+            }),
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: chrono::Utc::now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            parent_chat_id: None,
+            space_id: None,
+            last_seen_at: None,
+            room_gen: None,
+        }
+    }
+
+    #[test]
+    fn compact_requests_gate_on_harness_and_take_clears() {
+        let mut state = AppState::new();
+        state.chats.push(row("droid", Some(HarnessId::Droid)));
+        state.chats.push(row("opencode", Some(HarnessId::Opencode)));
+        state.chats.push(row("codex", Some(HarnessId::Codex)));
+        state.chats.push(row("bare", None));
+        assert!(state.request_compact("droid"));
+        assert_eq!(state.take_compact_request().as_deref(), Some("droid"));
+        assert_eq!(state.take_compact_request(), None);
+        assert!(state.request_compact("opencode"));
+        assert_eq!(state.take_compact_request().as_deref(), Some("opencode"));
+        assert!(!state.request_compact("codex"));
+        assert!(!state.request_compact("bare"));
+        assert!(!state.request_compact("missing"));
+        assert_eq!(state.take_compact_request(), None);
     }
 }

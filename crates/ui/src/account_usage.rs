@@ -263,6 +263,18 @@ impl AccountUsage {
         cx.notify();
     }
 
+    /// Whether the selected chat can compact (the context card's entry
+    /// point into the compact dialog).
+    fn compact_available(&self, cx: &gpui::App) -> bool {
+        let state = self.state.read(cx);
+        state
+            .selected_chat
+            .as_deref()
+            .and_then(|id| state.chats.iter().find(|chat| chat.id == id))
+            .and_then(|chat| chat.config.as_ref())
+            .is_some_and(|config| crate::state::cli_managed(config.harness))
+    }
+
     /// A footer ring that opens `card` above itself, right-aligned like the
     /// model picker.
     fn trigger(
@@ -444,7 +456,40 @@ impl Render for AccountUsage {
             self.trigger(
                 chip,
                 FooterCard::Context,
-                move |_, cx| crate::context_usage::card(context, &Theme::of(cx).for_popup()),
+                move |usage, cx| {
+                    let theme = Theme::of(cx).for_popup();
+                    let mut card = crate::context_usage::card(context, &theme);
+                    if usage.compact_available(cx) {
+                        card = card.child(
+                            div().px(px(8.0)).pb(px(8.0)).child(
+                                popover::btn_ghost(
+                                    &theme,
+                                    "Compact conversation",
+                                    "context-compact",
+                                )
+                                .id("context-compact-btn")
+                                .w_full()
+                                .justify_center()
+                                .on_click(cx.listener(
+                                    |usage, _, _, cx| {
+                                        let state = usage.state.clone();
+                                        let requested = state.update(cx, |state, _| {
+                                            state
+                                                .selected_chat
+                                                .clone()
+                                                .filter(|id| state.request_compact(id))
+                                        });
+                                        if requested.is_some() {
+                                            usage.dismiss(cx);
+                                        }
+                                        cx.notify();
+                                    },
+                                )),
+                            ),
+                        );
+                    }
+                    card
+                },
                 cx,
             )
         });

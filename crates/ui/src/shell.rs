@@ -52,7 +52,7 @@ use crate::settings::{
 };
 use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
-    format_time_ago, org_name_valid, parse_orgs, sort_memberships,
+    cli_managed, format_time_ago, org_name_valid, parse_orgs, sort_memberships,
 };
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
@@ -139,7 +139,6 @@ struct RewindState {
 /// `CompactChat`. OpenCode compacts through its own API (the picked model is
 /// applied to the session first — compaction uses the session's model);
 /// Droid runs its `/compress` turn with the picked model.
-#[derive(Clone)]
 struct CompactDialog {
     chat_id: String,
     device_id: String,
@@ -148,8 +147,13 @@ struct CompactDialog {
     models: Option<Vec<Model>>,
     /// Model id to compact with (defaults to the chat's current model).
     selected: Option<String>,
+    /// Live model filter (search box).
+    filter: Entity<ComposerInput>,
+    filter_text: String,
+    focus_pending: bool,
     error: Option<String>,
     working: bool,
+    _events: Subscription,
 }
 
 /// Open-in-CLI dialog: the native command that resumes this chat's provider
@@ -163,11 +167,6 @@ struct CliDialog {
     command: String,
 }
 
-/// Harnesses whose chats get the compact + open-in-terminal titlebar buttons.
-fn cli_managed(harness: HarnessId) -> bool {
-    matches!(harness, HarnessId::Opencode | HarnessId::Droid)
-}
-
 /// Native command resuming `session_id` in the agent's own terminal.
 /// `None` for harnesses without a CLI resume story.
 fn cli_resume_command(harness: HarnessId, session_id: &str) -> Option<String> {
@@ -176,6 +175,47 @@ fn cli_resume_command(harness: HarnessId, session_id: &str) -> Option<String> {
         HarnessId::Droid => Some(format!("droid --resume {session_id}")),
         _ => None,
     }
+}
+
+/// Models matching `filter` (case-insensitive substring over id, label,
+/// and provider), preserving catalog order. Pure.
+fn filter_models<'a>(models: &'a [Model], filter: &str) -> Vec<&'a Model> {
+    let needle = filter.trim().to_lowercase();
+    if needle.is_empty() {
+        return models.iter().collect();
+    }
+    models
+        .iter()
+        .filter(|model| {
+            model.id.to_lowercase().contains(&needle)
+                || model.label.to_lowercase().contains(&needle)
+                || model
+                    .description
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_lowercase()
+                    .contains(&needle)
+        })
+        .collect()
+}
+
+/// Group models under their provider name for the picker rows, preserving
+/// catalog order (providers stay in the order the catalog listed them).
+/// Pure.
+fn group_models<'a>(models: &[&'a Model]) -> Vec<(String, Vec<&'a Model>)> {
+    let mut groups: Vec<(String, Vec<&'a Model>)> = Vec::new();
+    for model in models {
+        let provider = model
+            .description
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "Other".into());
+        match groups.last_mut() {
+            Some((name, rows)) if *name == provider => rows.push(model),
+            _ => groups.push((provider, vec![model])),
+        }
+    }
+    groups
 }
 
 /// Restore a default focus only after an in-flight handoff has had a frame to
@@ -10065,31 +10105,75 @@ impl Shell {
     /// Open the compact dialog for the selected chat (OpenCode/Droid only)
     /// and fetch its model catalog for the picker.
     fn open_compact_dialog(&mut self, cx: &mut Context<Self>) {
-        let row = self.state.read(cx).selected_chat_row().cloned();
-        let Some(chat) = row else {
+        let id = self.state.read(cx).selected_chat.clone();
+        let Some(id) = id else {
             return;
+        };
+        self.open_compact_dialog_for(&id, cx);
+    }
+
+    /// [`Self::open_compact_dialog`] for an explicit chat (the context-window
+    /// popup has no selection of its own to read — it passes the id along).
+    /// Returns whether the dialog opened. The dialog opens synchronously so
+    /// the picker is usable without an engine; the model catalog follows
+    /// when one is connected.
+    fn open_compact_dialog_for(&mut self, chat_id: &str, cx: &mut Context<Self>) -> bool {
+        let row = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .cloned();
+        let Some(chat) = row else {
+            return false;
         };
         let Some(config) = chat.config.clone() else {
-            return;
+            return false;
         };
         if !cli_managed(config.harness) {
-            return;
+            return false;
         }
-        let engine = self.state.read(cx).engine().cloned();
-        let Some(engine) = engine else {
-            return;
-        };
-        let selected = config.model.clone();
+        let filter = cx.new(|cx| {
+            ComposerInput::new("Filter models…", cx)
+                .with_single_line()
+                .with_text_metrics(13.0, 17.0)
+                .with_accessibility_role(gpui::Role::TextInput)
+        });
+        let events = cx.subscribe(&filter, |this: &mut Shell, input, event, cx| {
+            match event {
+                ComposerInputEvent::Edited => {
+                    if let Some(dialog) = this.compact_dialog.as_mut() {
+                        dialog.filter_text = input.read(cx).text().to_owned();
+                        cx.notify();
+                    }
+                }
+                ComposerInputEvent::Submitted | ComposerInputEvent::ModifiedSubmitted => {
+                    this.confirm_compact(cx)
+                }
+                _ => {}
+            }
+        });
+        // A pending composer refocus must not steal the filter field.
+        self.composer
+            .update(cx, |composer, _| composer.focus_pending = false);
         self.compact_dialog = Some(CompactDialog {
             chat_id: chat.id.clone(),
             device_id: chat.device_id.clone(),
             harness: config.harness,
             models: None,
-            selected,
+            selected: config.model.clone(),
+            filter,
+            filter_text: String::new(),
+            focus_pending: true,
             error: None,
             working: false,
+            _events: events,
         });
         cx.notify();
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return true;
+        };
         let chat_id = chat.id.clone();
         let device_id = chat.device_id.clone();
         let harness = config.harness;
@@ -10130,6 +10214,7 @@ impl Shell {
             });
         })
         .detach();
+        true
     }
 
     /// Run `CompactChat` with the dialog's picked model.
@@ -10245,6 +10330,16 @@ impl Shell {
             return;
         };
         cx.notify();
+        // Reveal the right host like any surface opener: a pushed surface
+        // alone stays at width zero while the pane is closed.
+        let panel_key = self.panel_key(cx);
+        let was_open = self.panels.get(&panel_key).changes_open;
+        let from = self.right_target(cx);
+        self.panels
+            .update(&panel_key, |panel| panel.changes_open = true);
+        if !was_open {
+            self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
+        }
         let panel = self.right_terminal_panel(cx);
         let chat_id = dialog.chat_id.clone();
         let key = panel.update(cx, |panel, cx| {
@@ -10252,7 +10347,6 @@ impl Shell {
             panel.open_tab_for_chat(chat_id.clone(), cx)
         });
         if let Some(key) = key {
-            let panel_key = self.panel_key(cx);
             self.right_tabs
                 .entry(panel_key)
                 .or_default()
@@ -10391,6 +10485,16 @@ impl Shell {
     ) -> Vec<AnyElement> {
         let theme = Theme::of(cx).for_popup();
         let mut overlays: Vec<AnyElement> = Vec::new();
+
+        // Compact requested from the context-window popup (the footer has
+        // no Shell handle): open the dialog for the named chat.
+        if self.compact_dialog.is_none()
+            && let Some(chat_id) = self
+                .state
+                .update(cx, |state, _| state.take_compact_request())
+        {
+            self.open_compact_dialog_for(&chat_id, cx);
+        }
 
         if let Some(menu_state) = self.chat_menu.get().cloned() {
             let chat_id = menu_state.chat_id;
@@ -10700,7 +10804,20 @@ impl Shell {
             overlays.push(popover::modal("delete-chat-dialog", viewport, card));
         }
 
-        if let Some(dialog) = self.compact_dialog.clone() {
+        if self.compact_dialog.is_some() {
+            if self
+                .compact_dialog
+                .as_mut()
+                .map(|dialog| std::mem::take(&mut dialog.focus_pending))
+                .unwrap_or(false)
+            {
+                if let Some(dialog) = self.compact_dialog.as_ref() {
+                    let handle = dialog.filter.focus_handle(cx);
+                    window.focus(&handle, cx);
+                }
+            }
+        }
+        if let Some(dialog) = self.compact_dialog.as_ref() {
             let explain = match dialog.harness {
                 HarnessId::Opencode => {
                     "Summarize the session through OpenCode's own compaction. The picked model is applied to the session first — compaction uses the session's model."
@@ -10713,6 +10830,12 @@ impl Shell {
                     div()
                         .mt(px(6.0))
                         .child(popover::dialog_body(&theme, explain)),
+                )
+                .child(
+                    div().mt(px(10.0)).child(popover::search_input_frame(
+                        &theme,
+                        dialog.filter.clone().into_any_element(),
+                    )),
                 );
             match dialog.models.clone() {
                 None => {
@@ -10729,55 +10852,91 @@ impl Shell {
                     );
                 }
                 Some(models) => {
-                    if models.is_empty() && dialog.error.is_none() {
+                    let total = models.len();
+                    let shown = filter_models(&models, &dialog.filter_text);
+                    let groups = group_models(&shown);
+                    if shown.is_empty() {
                         card = card.child(
                             div()
                                 .mt(px(10.0))
                                 .text_size(crate::typography::ui_rems(12.5))
                                 .text_color(theme.text_muted)
-                                .child(SharedString::from("No models available.")),
+                                .child(SharedString::from(
+                                    if dialog.filter_text.trim().is_empty() {
+                                        "No models available."
+                                    } else {
+                                        "No models match this filter."
+                                    },
+                                )),
                         );
                     }
-                    let rows: Vec<AnyElement> = models
-                        .iter()
-                        .enumerate()
-                        .map(|(ix, model)| {
+                    let mut ix = 0_usize;
+                    let mut rows: Vec<AnyElement> = Vec::new();
+                    for (provider, group) in &groups {
+                        rows.push(
+                            div()
+                                .px(px(10.0))
+                                .pt(px(6.0))
+                                .text_size(crate::typography::ui_rems(11.0))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(provider.clone()))
+                                .into_any_element(),
+                        );
+                        for model in group {
                             let active = dialog.selected.as_deref() == Some(model.id.as_str());
                             let id = model.id.clone();
+                            let row_ix = ix;
+                            ix += 1;
+                            rows.push(
+                                div()
+                                    .id(("compact-model", row_ix))
+                                    .px(px(10.0))
+                                    .py(px(7.0))
+                                    .rounded(px(6.0))
+                                    .flex()
+                                    .flex_col()
+                                    .cursor_pointer()
+                                    .when(active, |el| el.bg(theme.glass_hover()))
+                                    .when(!active, |el| {
+                                        el.hover(|s| s.bg(theme.glass_hover().opacity(0.6)))
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(dialog) = this.compact_dialog.as_mut() {
+                                            dialog.selected = Some(id.clone());
+                                            dialog.error = None;
+                                            cx.notify();
+                                        }
+                                    }))
+                                    .child(
+                                        div()
+                                            .text_size(crate::typography::ui_rems(12.5))
+                                            .text_color(theme.text)
+                                            .child(SharedString::from(model.label.clone())),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(crate::typography::ui_rems(11.0))
+                                            .text_color(theme.text_faint)
+                                            .child(SharedString::from(model.id.clone())),
+                                    )
+                                    .into_any_element(),
+                            );
+                        }
+                    }
+                    if !dialog.filter_text.trim().is_empty() {
+                        rows.push(
                             div()
-                                .id(("compact-model", ix))
                                 .px(px(10.0))
-                                .py(px(7.0))
-                                .rounded(px(6.0))
-                                .flex()
-                                .flex_col()
-                                .cursor_pointer()
-                                .when(active, |el| el.bg(theme.glass_hover()))
-                                .when(!active, |el| {
-                                    el.hover(|s| s.bg(theme.glass_hover().opacity(0.6)))
-                                })
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(dialog) = this.compact_dialog.as_mut() {
-                                        dialog.selected = Some(id.clone());
-                                        dialog.error = None;
-                                        cx.notify();
-                                    }
-                                }))
-                                .child(
-                                    div()
-                                        .text_size(crate::typography::ui_rems(12.5))
-                                        .text_color(theme.text)
-                                        .child(SharedString::from(model.label.clone())),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(crate::typography::ui_rems(11.0))
-                                        .text_color(theme.text_faint)
-                                        .child(SharedString::from(model.id.clone())),
-                                )
-                                .into_any_element()
-                        })
-                        .collect();
+                                .pt(px(4.0))
+                                .text_size(crate::typography::ui_rems(11.0))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(format!(
+                                    "{} of {total} models",
+                                    shown.len()
+                                )))
+                                .into_any_element(),
+                        );
+                    }
                     card = card.child(
                         div()
                             .id("compact-model-list")
@@ -10800,7 +10959,11 @@ impl Shell {
                     }
                 }
             }
-            let confirm_label = if dialog.working { "Compacting…" } else { "Compact" };
+            let confirm_label = if dialog.working {
+                "Compacting…"
+            } else {
+                "Compact"
+            };
             card = card.child(
                 div()
                     .mt(px(16.0))
@@ -10819,12 +10982,14 @@ impl Shell {
                     .child(
                         popover::btn_primary(&theme, confirm_label)
                             .id("compact-confirm")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.confirm_compact(cx)
-                            })),
+                            .on_click(cx.listener(|this, _, _, cx| this.confirm_compact(cx))),
                     ),
             );
-            overlays.push(popover::modal("compact-dialog", viewport, card.into_any_element()));
+            overlays.push(popover::modal(
+                "compact-dialog",
+                viewport,
+                card.into_any_element(),
+            ));
         }
 
         if let Some(dialog) = self.cli_dialog.clone() {
@@ -14106,7 +14271,15 @@ mod tests {
         assert!(cli_managed(Opencode));
         assert!(cli_managed(Droid));
         for other in [
-            ClaudeCode, Codex, Cursor, Devin, Grok, Hermes, Pi, Antigravity, Mock,
+            ClaudeCode,
+            Codex,
+            Cursor,
+            Devin,
+            Grok,
+            Hermes,
+            Pi,
+            Antigravity,
+            Mock,
         ] {
             assert!(!cli_managed(other), "{other:?} must not get the buttons");
         }
@@ -14119,6 +14292,50 @@ mod tests {
             Some("droid --resume abc")
         );
         assert_eq!(cli_resume_command(Codex, "x"), None);
+    }
+
+    fn picker_model(id: &str, label: &str, provider: Option<&str>) -> Model {
+        Model {
+            id: id.into(),
+            label: label.into(),
+            description: provider.map(str::to_owned),
+            reasoning_levels: Vec::new(),
+            options: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn compact_picker_filters_and_groups_by_provider() {
+        let models = vec![
+            picker_model("anthropic/claude-opus", "Opus", Some("Anthropic")),
+            picker_model("openai/gpt-5", "GPT-5", Some("OpenAI")),
+            picker_model("anthropic/claude-haiku", "Haiku", Some("Anthropic")),
+            picker_model("auto", "Auto", None),
+        ];
+        // "an" matches both Anthropic rows (id and provider), nothing else.
+        let shown = filter_models(&models, "an");
+        assert_eq!(shown.len(), 2);
+        let groups = group_models(&shown);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, "Anthropic");
+        assert_eq!(groups[0].1.len(), 2);
+        // Case-insensitive; provider-less models group under Other.
+        assert_eq!(filter_models(&models, "GPT").len(), 1);
+        assert_eq!(filter_models(&models, "zzz").len(), 0);
+        assert_eq!(filter_models(&models, "  ").len(), 4);
+        let groups = group_models(&filter_models(&models, ""));
+        assert_eq!(
+            groups
+                .iter()
+                .map(|(name, rows)| (name.as_str(), rows.len()))
+                .collect::<Vec<_>>(),
+            [
+                ("Anthropic", 1),
+                ("OpenAI", 1),
+                ("Anthropic", 1),
+                ("Other", 1)
+            ]
+        );
     }
 
     pub(super) fn chat_with_path(
@@ -16336,6 +16553,85 @@ mod exit_regressions {
                     .unwrap();
             }
         }
+    }
+
+    #[gpui::test]
+    fn open_cli_dialog_builds_the_resume_command_and_reveals_a_terminal(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        window
+            .update(cx, |shell, _, cx| {
+                let mut chat = super::tests::chat_with_path(Some("/repo"), None);
+                chat.id = "c1".into();
+                chat.config = Some(zeron_proto::ChatConfig {
+                    harness: zeron_proto::HarnessId::Opencode,
+                    model: None,
+                    reasoning: None,
+                    model_options: Default::default(),
+                    sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+                });
+                chat.harness_session_id = Some("ses_1".into());
+                chat.harness_session_cwd = Some("/repo".into());
+                shell.state.update(cx, |state, _| {
+                    state.chats.push(chat);
+                    state.selected_chat = Some("c1".into());
+                });
+                shell.active_chat = "c1".into();
+
+                shell.open_cli_dialog(cx);
+                let dialog = shell.cli_dialog.clone().expect("dialog opens");
+                assert_eq!(dialog.command, "opencode --session ses_1");
+
+                shell.open_cli_in_terminal(cx);
+                assert!(shell.cli_dialog.is_none(), "dialog closes");
+                let key = shell.panel_key(cx);
+                assert!(
+                    shell.panels.get(&key).changes_open,
+                    "the right host opens with the surface"
+                );
+                assert!(
+                    shell
+                        .right_tabs
+                        .get(&key)
+                        .is_some_and(|tabs| tabs
+                            .iter()
+                            .any(|surface| matches!(surface, RightSurface::Terminal(_)))),
+                    "a terminal surface is pushed"
+                );
+                // `resolved_right_active` needs the tab's backing PTY (an
+                // engine), so activation itself is not assertable here; the
+                // pushed surface plus the opened host is the regression
+                // (a surface alone stays at width zero).
+            })
+            .unwrap();
     }
 
     #[gpui::test]

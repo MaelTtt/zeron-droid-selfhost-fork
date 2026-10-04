@@ -22,7 +22,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.102-mael.3"
+version = "0.2.102-mael.4"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -153,6 +153,11 @@ strip = "symbols"
 [profile.dev]
 # gpui is slow unoptimized; match zed's approach for deps
 opt-level = 0
+# Line tables only: full debuginfo doubles the multi-GB links this
+# workspace produces (test binaries link ~2 GB). Backtraces keep file:line;
+# restore full symbols per-build with CARGO_PROFILE_DEV_DEBUG=true (env
+# overrides the file, unlike RUSTFLAGS which would also drop mold).
+debug = 1
 
 [profile.dev.package."*"]
 opt-level = 2
