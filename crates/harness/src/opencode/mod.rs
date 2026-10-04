@@ -335,6 +335,73 @@ impl OpencodeHarness {
         server.shutdown(self.kill_grace).await;
         result
     }
+
+    /// Queue a durable compaction request on an existing session
+    /// (`POST /api/session/{id}/compact`). Compaction uses the session's
+    /// model, so an optional `model` (`provider/id`) is applied to the
+    /// session first — that is how a compaction model is chosen.
+    ///
+    /// The call admits the request and returns; the summary generates
+    /// server-side. Callers must refuse while a turn is in flight (like
+    /// rewind): a second server process must not race the live run.
+    pub async fn compact(
+        &self,
+        session_id: &str,
+        cwd: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<(), HarnessError> {
+        if session_id.trim().is_empty() {
+            return Err(HarnessError::Protocol(
+                "no OpenCode session to compact yet — send a message first".into(),
+            ));
+        }
+        let wanted = model
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(|m| {
+                m.split_once('/').ok_or_else(|| {
+                    HarnessError::Protocol(
+                        "compaction model must look like `provider/model`".into(),
+                    )
+                })
+            })
+            .transpose()?;
+        let mut server = self.server(cwd, None).await?;
+        let result = async {
+            // Existence proof (doubles as the resume check a run would do).
+            server.session_info(session_id, cwd).await?;
+            if server.protocol().await == Protocol::V2 {
+                if let Some((provider, model_id)) = wanted {
+                    let providers = server.provider_catalog(cwd).await.unwrap_or_default();
+                    let variant = pick_variant(&providers, provider, model_id, None);
+                    server
+                        .set_model(session_id, provider, model_id, variant.as_deref(), cwd)
+                        .await?;
+                }
+                let path = format!("/api/session/{session_id}/compact");
+                server
+                    .post_json(&path, cwd, &json!({}))
+                    .await
+                    .map(|_| ())
+            } else {
+                // 1.x documents no compact route; try the analogous path
+                // before sending the user to the TUI.
+                let path = format!("/session/{session_id}/compact");
+                server
+                    .post_json(&path, cwd, &json!({}))
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| {
+                        HarnessError::Protocol(format!(
+                            "{e} (this opencode server has no compact API — run /compact in its TUI)"
+                        ))
+                    })
+            }
+        }
+        .await;
+        server.shutdown(self.kill_grace).await;
+        result
+    }
 }
 
 #[async_trait]

@@ -2536,3 +2536,148 @@ fn native_skill_catalog_rejects_unrepresentable_commands() {
         assert_eq!(invocation_links(&invocation.link())[0].1, invocation);
     }
 }
+
+/// Minimal V2 stub for [`OpencodeHarness::compact`]: version-bearing health,
+/// one known session, a one-model catalog; every POST is recorded.
+struct CompactWire {
+    posts: Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for CompactWire {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+impl CompactWire {
+    async fn start() -> (String, Self) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let posts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = posts.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let recorded = recorded.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0; 4096];
+                    let header_end = loop {
+                        let n = socket.read(&mut buf).await.unwrap();
+                        if n == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buf[..n]);
+                        if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break end + 4;
+                        }
+                    };
+                    let header = String::from_utf8_lossy(&request[..header_end]);
+                    let is_post = header.starts_with("POST ");
+                    let path = header
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap()
+                        .to_owned();
+                    let length = header
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    while request.len() < header_end + length {
+                        let n = socket.read(&mut buf).await.unwrap();
+                        if n == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buf[..n]);
+                    }
+                    if is_post {
+                        recorded.lock().unwrap().push((
+                            path.clone(),
+                            serde_json::from_slice(&request[header_end..header_end + length])
+                                .unwrap_or(Value::Null),
+                        ));
+                    }
+                    let (status, body) = match (is_post, path.as_str()) {
+                        (false, "/api/info") => ("200 OK", r#"{"version":"2.0.11"}"#),
+                        (false, "/api/session/ses1") => ("200 OK", r#"{"data":{"id":"ses1"}}"#),
+                        (false, "/api/model") => (
+                            "200 OK",
+                            r#"{"data":[{"providerID":"opencode","id":"muse","name":"Muse","limit":{"context":1000},"variants":[{"id":"low"}],"enabled":true}]}"#,
+                        ),
+                        (_, "/api/session/nope") => ("404 Not Found", r#"{"error":"missing"}"#),
+                        _ => ("200 OK", "{}"),
+                    };
+                    socket
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+        (base, Self { posts, server })
+    }
+
+    fn posts(&self) -> Vec<(String, Value)> {
+        self.posts.lock().unwrap().clone()
+    }
+}
+
+#[tokio::test]
+async fn compact_sets_the_session_model_then_posts_compact() {
+    let (base, wire) = CompactWire::start().await;
+    let harness = OpencodeHarness::new().with_base_url(base);
+    harness
+        .compact("ses1", Some("/tmp"), Some("opencode/muse"))
+        .await
+        .unwrap();
+    let paths: Vec<String> = wire.posts().into_iter().map(|(p, _)| p).collect();
+    assert_eq!(
+        paths,
+        vec![
+            "/api/session/ses1/model".to_string(),
+            "/api/session/ses1/compact".to_string()
+        ],
+        "model first (compaction uses the session model), then the request"
+    );
+}
+
+#[tokio::test]
+async fn compact_without_a_model_posts_only_the_request() {
+    let (base, wire) = CompactWire::start().await;
+    let harness = OpencodeHarness::new().with_base_url(base);
+    harness.compact("ses1", Some("/tmp"), None).await.unwrap();
+    let paths: Vec<String> = wire.posts().into_iter().map(|(p, _)| p).collect();
+    assert_eq!(paths, vec!["/api/session/ses1/compact".to_string()]);
+}
+
+#[tokio::test]
+async fn compact_rejects_missing_sessions_and_bad_input() {
+    let (base, _wire) = CompactWire::start().await;
+    let harness = OpencodeHarness::new().with_base_url(base);
+    let missing = harness.compact("nope", Some("/tmp"), None).await;
+    assert!(missing.is_err(), "unknown sessions must surface, not hang");
+    // No server involved: input validation fails before any spawn.
+    let plain = OpencodeHarness::new();
+    assert!(plain.compact("", Some("/tmp"), None).await.is_err());
+    assert!(
+        plain
+            .compact("ses1", Some("/tmp"), Some("bare-model-id"))
+            .await
+            .is_err()
+    );
+}

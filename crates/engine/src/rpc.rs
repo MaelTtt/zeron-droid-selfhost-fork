@@ -735,7 +735,7 @@ impl EngineRpc {
     fn local_importer(&self) -> Result<&crate::local_import::LocalImporter, RpcError> {
         self.local_import
             .as_ref()
-            .ok_or_else(|| RpcError::Failed("local import requires a synced workspace".into()))
+            .ok_or_else(|| RpcError::Failed("local import requires an account workspace".into()))
     }
 
     fn local_project_action_space(&self, space_id: &str) -> Result<Space, RpcError> {
@@ -1338,6 +1338,7 @@ fn forwardable(method: &str) -> bool {
         method,
         methods::FORK_SIDE_CHAT
             | methods::REWIND_CHAT
+            | methods::COMPACT_CHAT
             | methods::LIST_HARNESSES
             | methods::INSTALL_HARNESS
             | methods::CANCEL_INSTALL
@@ -1880,6 +1881,104 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(failed)?;
                 RpcReply::value(&serde_json::json!({ "removed": removed }))
+            }
+            methods::COMPACT_CHAT => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct CompactParams {
+                    chat_id: String,
+                    #[serde(default)]
+                    model: Option<String>,
+                }
+                let p: CompactParams = parse_params(params)?;
+                let failed = |e: crate::EngineError| RpcError::Failed(e.to_string());
+                let chat = self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .map_err(failed)?
+                    .ok_or_else(|| RpcError::Failed("Chat no longer exists".into()))?;
+                if chat.device_id != self.doc_host.device_id() {
+                    return Err(RpcError::Failed(
+                        "Compact must run on the chat's device".into(),
+                    ));
+                }
+                let config = chat
+                    .config
+                    .clone()
+                    .ok_or_else(|| RpcError::Failed("This chat has no agent harness yet".into()))?;
+                if !matches!(config.harness, HarnessId::Opencode | HarnessId::Droid) {
+                    return Err(RpcError::Failed(
+                        "Compact is only supported for OpenCode and Droid chats".into(),
+                    ));
+                }
+                if self.sessions.turn_in_flight(&p.chat_id) {
+                    return Err(RpcError::Failed(
+                        "Stop the agent before compacting this chat".into(),
+                    ));
+                }
+                // The cwd the provider session was created under — harness
+                // session stores are cwd-scoped, so resume (and compact) only
+                // apply from the same directory.
+                let cwd = chat
+                    .harness_session_cwd
+                    .clone()
+                    .filter(|cwd| !cwd.is_empty())
+                    .or_else(|| chat.cwd.clone())
+                    .filter(|cwd| !cwd.is_empty());
+                match config.harness {
+                    HarnessId::Opencode => {
+                        let cwd = cwd.as_deref();
+                        let session_id = cwd
+                            .and_then(|cwd| self.sessions.harness_session_for(&p.chat_id, cwd))
+                            .filter(|id| !id.is_empty())
+                            .ok_or_else(|| {
+                                RpcError::Failed(
+                                    "No OpenCode session to compact yet — send a message first"
+                                        .into(),
+                                )
+                            })?;
+                        let model = p.model.as_deref().filter(|m| !m.trim().is_empty());
+                        zeron_harness::OpencodeHarness::new()
+                            .compact(&session_id, cwd, model)
+                            .await
+                            .map_err(|e| RpcError::Failed(e.to_string()))?;
+                        RpcReply::value(&serde_json::json!({ "compacted": true }))
+                    }
+                    HarnessId::Droid => {
+                        let cwd = cwd.ok_or_else(|| {
+                            RpcError::Failed("This chat has no working directory".into())
+                        })?;
+                        // Droid exposes no compaction API — queue its own
+                        // `/compress` turn with the chat's config (plus the
+                        // requested model, if any). It reads like any send.
+                        let request = zeron_proto::RunRequest {
+                            mcp: None,
+                            prompt: "/compress".into(),
+                            harness: Some(HarnessId::Droid),
+                            model: p.model.clone().or(config.model.clone()),
+                            reasoning: config.reasoning,
+                            model_options: config.model_options.clone(),
+                            cwd,
+                            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+                            auto_approve: false,
+                            resume: None,
+                            attachments: Vec::new(),
+                            worktree: None,
+                        };
+                        let command_id = self
+                            .doc_host
+                            .queue_command(
+                                &p.chat_id,
+                                SessionCommandPayload::Run {
+                                    request,
+                                    message_id: uuid::Uuid::new_v4().to_string(),
+                                },
+                            )
+                            .map_err(failed)?;
+                        RpcReply::value(&serde_json::json!({ "commandId": command_id }))
+                    }
+                    _ => unreachable!("gated above"),
+                }
             }
             methods::FORK_SIDE_CHAT => {
                 #[derive(Deserialize)]

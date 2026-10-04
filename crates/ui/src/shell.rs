@@ -24,7 +24,7 @@ use gpui::{
 
 use gpui_tokio::Tokio;
 use zeron_engine::InstanceLock;
-use zeron_proto::{AuthState, WorkspaceScope};
+use zeron_proto::{AuthState, HarnessId, Model, WorkspaceScope};
 use zeron_rpc::methods;
 
 use crate::changes::{Changes, ChangesEvent, DiscardWorkingTreeRequest};
@@ -133,6 +133,49 @@ fn rewind_tap(last: Option<Instant>, now: Instant) -> (bool, Option<Instant>) {
 /// The open rewind list: a highlight into the newest-first prompt list.
 struct RewindState {
     selected: usize,
+}
+
+/// Compact dialog: pick the model that summarizes this session, then
+/// `CompactChat`. OpenCode compacts through its own API (the picked model is
+/// applied to the session first — compaction uses the session's model);
+/// Droid runs its `/compress` turn with the picked model.
+#[derive(Clone)]
+struct CompactDialog {
+    chat_id: String,
+    device_id: String,
+    harness: HarnessId,
+    /// Discovered models (`None` while the `ListModels` probe is in flight).
+    models: Option<Vec<Model>>,
+    /// Model id to compact with (defaults to the chat's current model).
+    selected: Option<String>,
+    error: Option<String>,
+    working: bool,
+}
+
+/// Open-in-CLI dialog: the native command that resumes this chat's provider
+/// session in the agent's own terminal.
+#[derive(Clone)]
+struct CliDialog {
+    chat_id: String,
+    harness: HarnessId,
+    session_id: String,
+    cwd: String,
+    command: String,
+}
+
+/// Harnesses whose chats get the compact + open-in-terminal titlebar buttons.
+fn cli_managed(harness: HarnessId) -> bool {
+    matches!(harness, HarnessId::Opencode | HarnessId::Droid)
+}
+
+/// Native command resuming `session_id` in the agent's own terminal.
+/// `None` for harnesses without a CLI resume story.
+fn cli_resume_command(harness: HarnessId, session_id: &str) -> Option<String> {
+    match harness {
+        HarnessId::Opencode => Some(format!("opencode --session {session_id}")),
+        HarnessId::Droid => Some(format!("droid --resume {session_id}")),
+        _ => None,
+    }
 }
 
 /// Restore a default focus only after an in-flight handoff has had a frame to
@@ -1443,7 +1486,10 @@ struct ChatRename {
     reveal_until: Option<std::time::Instant>,
     _events: Subscription,
     /// Commit-on-blur, armed once the input has taken focus.
-    _blur: Option<Subscription>,/// In-app update lifecycle (macOS bundle installs; see `render_update_strip`).
+    _blur: Option<Subscription>,
+}
+
+/// In-app update lifecycle (macOS bundle installs; see `render_update_strip`).
 enum UpdateFlow {
     Idle,
     Downloading,
@@ -1452,7 +1498,8 @@ enum UpdateFlow {
     /// Managed (headless) apply in flight — the `ApplyUpdate` RPC stages,
     /// swaps, and restarts the engine service; the strip waits on it.
     Applying,
-    Failed(SharedString),}
+    Failed(SharedString),
+}
 
 /// Account lifecycle owned by this process. Sign-in on a local workspace
 /// flows through the in-place switch wizard (offer → switch → import → done);
@@ -1967,6 +2014,10 @@ pub struct Shell {
     chat_rename: Option<ChatRename>,
     /// Chat id awaiting delete confirmation.
     delete_confirm: Option<String>,
+    /// Compact-model picker for an OpenCode/Droid chat.
+    compact_dialog: Option<CompactDialog>,
+    /// Native resume command for an OpenCode/Droid chat.
+    cli_dialog: Option<CliDialog>,
     /// Global confirmation/error dialog for the Changes-pane trash action. The
     /// RPC task is retained separately so rerenders do not cancel it.
     discard_working_tree: Option<DiscardWorkingTreeFlow>,
@@ -2057,7 +2108,8 @@ pub struct Shell {
     install: zeron_update::InstallKind,
     /// mael-fork build (`.mael-fork` marker / `ZERON_FORK`) — the strip may
     /// detect a newer release, but applying stock would clobber the fork.
-    fork: bool,    org: Option<OrgGateUi>,
+    fork: bool,
+    org: Option<OrgGateUi>,
     sync_flow: SyncFlow,
     mutate_task: Option<Task<()>>,
     auth_task: Option<Task<()>>,
@@ -2441,6 +2493,8 @@ impl Shell {
             chat_menu: popover::Popup::default(),
             chat_rename: None,
             delete_confirm: None,
+            compact_dialog: None,
+            cli_dialog: None,
             discard_working_tree: None,
             discard_working_tree_task: None,
             space_menu: popover::Popup::default(),
@@ -2489,7 +2543,8 @@ impl Shell {
             update_task: None,
             update_dismissed: None,
             install: zeron_update::detect_install(),
-            fork: zeron_update::is_fork_install(),            org: None,
+            fork: zeron_update::is_fork_install(),
+            org: None,
             sync_flow: SyncFlow::Idle,
             mutate_task: None,
             auth_task: None,
@@ -8600,17 +8655,14 @@ impl Shell {
     /// can't replace themselves explain why; advisory installs point at
     /// `zeron update` or the GitHub releases page and dismiss per version.
     fn render_update_strip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let status = self.state.read(cx).update.clone()?;
-        if !status.update_available {
-            return None;
-        }
-        let latest = status.latest_version.clone()?;
+        let latest = Self::latest_available(cx)?;
         if self.update_dismissed.as_deref() == Some(latest.as_str()) {
             return None;
         }
         let (label, clickable) =
             Self::update_strip_label(&self.install, &self.update_flow, &latest, self.fork);
-        let failed = matches!(self.update_flow, UpdateFlow::Failed(_));        let tone = if failed { theme.danger } else { theme.accent };
+        let failed = matches!(self.update_flow, UpdateFlow::Failed(_));
+        let tone = if failed { theme.danger } else { theme.accent };
         // Follow the selected spectrum with a low-emphasis glass tint rather
         // than painting the bright text accent as a solid slab.
         let (chip_bg, chip_bg_hover) = if failed {
@@ -8639,10 +8691,19 @@ impl Shell {
             strip = strip
                 .cursor_pointer()
                 .hover(move |s| s.bg(chip_bg_hover))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.on_update_strip_click(window, cx)
-                }));        }
+                .on_click(
+                    cx.listener(move |this, _, window, cx| this.on_update_strip_click(window, cx)),
+                );
+        }
         Some(strip.into_any_element())
+    }
+
+    /// Newest release the desktop checker ([`crate::app_update`]) found, if
+    /// any. The fork's strip reads it from the `AppUpdate` global instead of
+    /// the old engine status frame.
+    fn latest_available(cx: &App) -> Option<String> {
+        crate::app_update::AppUpdate::global(cx)
+            .and_then(|update| update.read(cx).available().map(str::to_owned))
     }
 
     /// The update strip's label and click affordance per install kind. Desktop
@@ -8660,6 +8721,16 @@ impl Shell {
         latest: &str,
         fork: bool,
     ) -> (SharedString, bool) {
+        // A fork build offered a stock release drafts a rebase session, never
+        // an apply — checked first so the label matches `on_update_strip_click`
+        // on every install kind (upstream now counts Linux managed installs
+        // as desktop-updateable, which would otherwise hide the fork guard).
+        if fork && !zeron_update::is_fork_version(latest) {
+            return (
+                format!("Update available — v{latest} · click to draft update session").into(),
+                true,
+            );
+        }
         if install.supports_desktop_update() {
             match flow {
                 UpdateFlow::Idle => (format!("Update available — v{latest}").into(), true),
@@ -8669,23 +8740,13 @@ impl Shell {
                 UpdateFlow::Failed(message) => (format!("Update failed: {message}").into(), true),
             }
         } else if matches!(install, zeron_update::InstallKind::Managed { .. }) {
-            if fork && !zeron_update::is_fork_version(latest) {
-                (
-                    format!("Update available — v{latest} · click to draft update session")
-                        .into(),
+            match flow {
+                UpdateFlow::Applying => (format!("Updating to v{latest}…").into(), false),
+                UpdateFlow::Failed(message) => (format!("Update failed: {message}").into(), true),
+                _ => (
+                    format!("Update available — v{latest} · click to update").into(),
                     true,
-                )
-            } else {
-                match flow {
-                    UpdateFlow::Applying => (format!("Updating to v{latest}…").into(), false),
-                    UpdateFlow::Failed(message) => {
-                        (format!("Update failed: {message}").into(), true)
-                    }
-                    _ => (
-                        format!("Update available — v{latest} · click to update").into(),
-                        true,
-                    ),
-                }
+                ),
             }
         } else {
             (
@@ -8706,13 +8767,7 @@ impl Shell {
         // the strip drafts the rebase work as a new session instead — the
         // user's own agent rebases, rebuilds, and reinstalls (see FORK.md).
         if self.fork
-            && self
-                .state
-                .read(cx)
-                .update
-                .as_ref()
-                .and_then(|s| s.latest_version.as_deref())
-                .is_some_and(|v| !zeron_update::is_fork_version(v))
+            && Self::latest_available(cx).is_some_and(|v| !zeron_update::is_fork_version(&v))
         {
             self.open_fork_rebase_session(window, cx);
             return;
@@ -8725,13 +8780,7 @@ impl Shell {
         // process), then hides: the fresh engine reports up to date when it
         // rejoins.
         let fork_apply = self.fork
-            && self
-                .state
-                .read(cx)
-                .update
-                .as_ref()
-                .and_then(|s| s.latest_version.as_deref())
-                .is_some_and(zeron_update::is_fork_version);
+            && Self::latest_available(cx).is_some_and(|v| zeron_update::is_fork_version(&v));
         if matches!(self.install, zeron_update::InstallKind::Managed { .. })
             && (!self.fork || fork_apply)
         {
@@ -8780,12 +8829,7 @@ impl Shell {
             if matches!(self.install, zeron_update::InstallKind::Unmanaged) {
                 cx.open_url(zeron_update::RELEASES_PAGE);
             }
-            self.update_dismissed = self
-                .state
-                .read(cx)
-                .update
-                .as_ref()
-                .and_then(|s| s.latest_version.clone());
+            self.update_dismissed = Self::latest_available(cx);
             cx.notify();
             return;
         }
@@ -8803,14 +8847,8 @@ impl Shell {
     /// reviews, picks their harness, and sends). The agent does the
     /// `zeron-fork-update` rebase + rebuild + install per FORK.md.
     fn open_fork_rebase_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let latest = self
-            .state
-            .read(cx)
-            .update
-            .as_ref()
-            .and_then(|s| s.latest_version.clone())
-            .unwrap_or_default();
-        self.open_new_session(cx);
+        let latest = Self::latest_available(cx).unwrap_or_default();
+        self.open_new_session(None, cx);
         let prompt = Self::fork_rebase_prompt(&latest);
         self.composer.update(cx, |composer, cx| {
             composer
@@ -10024,6 +10062,209 @@ impl Shell {
         cx.notify();
     }
 
+    /// Open the compact dialog for the selected chat (OpenCode/Droid only)
+    /// and fetch its model catalog for the picker.
+    fn open_compact_dialog(&mut self, cx: &mut Context<Self>) {
+        let row = self.state.read(cx).selected_chat_row().cloned();
+        let Some(chat) = row else {
+            return;
+        };
+        let Some(config) = chat.config.clone() else {
+            return;
+        };
+        if !cli_managed(config.harness) {
+            return;
+        }
+        let engine = self.state.read(cx).engine().cloned();
+        let Some(engine) = engine else {
+            return;
+        };
+        let selected = config.model.clone();
+        self.compact_dialog = Some(CompactDialog {
+            chat_id: chat.id.clone(),
+            device_id: chat.device_id.clone(),
+            harness: config.harness,
+            models: None,
+            selected,
+            error: None,
+            working: false,
+        });
+        cx.notify();
+        let chat_id = chat.id.clone();
+        let device_id = chat.device_id.clone();
+        let harness = config.harness;
+        cx.spawn(async move |this, cx| {
+            let mut params = serde_json::json!({ "harness": harness, "force": false });
+            if let Some(object) = params.as_object_mut() {
+                object.insert(
+                    "targetDeviceId".into(),
+                    serde_json::Value::String(device_id),
+                );
+            }
+            let result = engine.client().call(methods::LIST_MODELS, params).await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(dialog) = this
+                    .compact_dialog
+                    .as_mut()
+                    .filter(|dialog| dialog.chat_id == chat_id)
+                else {
+                    return;
+                };
+                match result {
+                    Ok(models) => match serde_json::from_value::<Vec<Model>>(models) {
+                        Ok(models) => {
+                            if dialog.selected.is_none() {
+                                dialog.selected = models.first().map(|m| m.id.clone());
+                            }
+                            dialog.models = Some(models);
+                        }
+                        Err(error) => {
+                            dialog.error = Some(format!("Could not read models: {error}"));
+                        }
+                    },
+                    Err(error) => {
+                        dialog.error = Some(format!("Could not list models: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Run `CompactChat` with the dialog's picked model.
+    fn confirm_compact(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.compact_dialog.as_mut() else {
+            return;
+        };
+        if dialog.working {
+            return;
+        }
+        dialog.working = true;
+        dialog.error = None;
+        cx.notify();
+        let (chat_id, device_id, model) = (
+            dialog.chat_id.clone(),
+            dialog.device_id.clone(),
+            dialog.selected.clone(),
+        );
+        let engine = self.state.read(cx).engine().cloned();
+        let Some(engine) = engine else {
+            if let Some(dialog) = self.compact_dialog.as_mut() {
+                dialog.working = false;
+                dialog.error = Some("Engine not connected".into());
+            }
+            cx.notify();
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::COMPACT_CHAT,
+                    serde_json::json!({
+                        "chatId": chat_id,
+                        "model": model,
+                        "targetDeviceId": device_id,
+                    }),
+                )
+                .await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(_) => {
+                    this.compact_dialog = None;
+                    cx.notify();
+                }
+                Err(error) => {
+                    if let Some(dialog) = this.compact_dialog.as_mut() {
+                        dialog.working = false;
+                        dialog.error = Some(format!("Could not compact: {error}"));
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Open the open-in-CLI dialog for the selected chat (OpenCode/Droid
+    /// with a provider session). The resume command comes straight from the
+    /// chat row — no engine round trip.
+    fn open_cli_dialog(&mut self, cx: &mut Context<Self>) {
+        let row = self.state.read(cx).selected_chat_row().cloned();
+        let Some(chat) = row else {
+            return;
+        };
+        let config = chat.config.clone().filter(|c| cli_managed(c.harness));
+        let Some(config) = config else {
+            return;
+        };
+        let Some(session_id) = chat
+            .harness_session_id
+            .clone()
+            .filter(|id| !id.trim().is_empty())
+        else {
+            self.composer.update(cx, |composer, cx| {
+                composer.show_error(
+                    SharedString::from("No provider session yet — send a message first"),
+                    cx,
+                )
+            });
+            return;
+        };
+        let cwd = chat
+            .harness_session_cwd
+            .clone()
+            .filter(|cwd| !cwd.is_empty())
+            .or_else(|| chat.cwd.clone())
+            .unwrap_or_else(|| "~".into());
+        let Some(command) = cli_resume_command(config.harness, &session_id) else {
+            return;
+        };
+        self.cli_dialog = Some(CliDialog {
+            chat_id: chat.id,
+            harness: config.harness,
+            session_id,
+            cwd,
+            command,
+        });
+        cx.notify();
+    }
+
+    /// Copy the dialog's resume command to the clipboard.
+    fn copy_cli_command(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.cli_dialog.as_ref() {
+            cx.write_to_clipboard(ClipboardItem::new_string(dialog.command.clone()));
+        }
+    }
+
+    /// Open a fresh embedded terminal tab on the dialog's chat and run its
+    /// resume command there. The bytes ride the tab's input coalescer, so
+    /// they land once the PTY exists even if OpenTerminal is still in flight.
+    fn open_cli_in_terminal(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.cli_dialog.take() else {
+            return;
+        };
+        cx.notify();
+        let panel = self.right_terminal_panel(cx);
+        let chat_id = dialog.chat_id.clone();
+        let key = panel.update(cx, |panel, cx| {
+            panel.set_open(true, cx);
+            panel.open_tab_for_chat(chat_id.clone(), cx)
+        });
+        if let Some(key) = key {
+            let panel_key = self.panel_key(cx);
+            self.right_tabs
+                .entry(panel_key)
+                .or_default()
+                .push(RightSurface::Terminal(key));
+            self.set_right_active(RightSurface::Terminal(key), cx);
+            let command = format!("{}\n", dialog.command);
+            panel.update(cx, |panel, cx| {
+                panel.write_to_tab(&chat_id, key, command.as_bytes(), cx)
+            });
+        }
+    }
+
     /// The rewind list, sitting directly above the composer so the prompt you
     /// pick appears where it will land.
     fn render_rewind_list(&mut self, width: f32, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -10457,6 +10698,199 @@ impl Shell {
                 )
                 .into_any_element();
             overlays.push(popover::modal("delete-chat-dialog", viewport, card));
+        }
+
+        if let Some(dialog) = self.compact_dialog.clone() {
+            let explain = match dialog.harness {
+                HarnessId::Opencode => {
+                    "Summarize the session through OpenCode's own compaction. The picked model is applied to the session first — compaction uses the session's model."
+                }
+                _ => "Run Droid's own /compress turn with the picked model.",
+            };
+            let mut card = popover::dialog_card(&theme)
+                .child(popover::dialog_title(&theme, "Compact conversation"))
+                .child(
+                    div()
+                        .mt(px(6.0))
+                        .child(popover::dialog_body(&theme, explain)),
+                );
+            match dialog.models.clone() {
+                None => {
+                    let label = dialog
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "Loading models…".into());
+                    card = card.child(
+                        div()
+                            .mt(px(10.0))
+                            .text_size(crate::typography::ui_rems(12.5))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(label)),
+                    );
+                }
+                Some(models) => {
+                    if models.is_empty() && dialog.error.is_none() {
+                        card = card.child(
+                            div()
+                                .mt(px(10.0))
+                                .text_size(crate::typography::ui_rems(12.5))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from("No models available.")),
+                        );
+                    }
+                    let rows: Vec<AnyElement> = models
+                        .iter()
+                        .enumerate()
+                        .map(|(ix, model)| {
+                            let active = dialog.selected.as_deref() == Some(model.id.as_str());
+                            let id = model.id.clone();
+                            div()
+                                .id(("compact-model", ix))
+                                .px(px(10.0))
+                                .py(px(7.0))
+                                .rounded(px(6.0))
+                                .flex()
+                                .flex_col()
+                                .cursor_pointer()
+                                .when(active, |el| el.bg(theme.glass_hover()))
+                                .when(!active, |el| {
+                                    el.hover(|s| s.bg(theme.glass_hover().opacity(0.6)))
+                                })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(dialog) = this.compact_dialog.as_mut() {
+                                        dialog.selected = Some(id.clone());
+                                        dialog.error = None;
+                                        cx.notify();
+                                    }
+                                }))
+                                .child(
+                                    div()
+                                        .text_size(crate::typography::ui_rems(12.5))
+                                        .text_color(theme.text)
+                                        .child(SharedString::from(model.label.clone())),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(crate::typography::ui_rems(11.0))
+                                        .text_color(theme.text_faint)
+                                        .child(SharedString::from(model.id.clone())),
+                                )
+                                .into_any_element()
+                        })
+                        .collect();
+                    card = card.child(
+                        div()
+                            .id("compact-model-list")
+                            .mt(px(10.0))
+                            .max_h(px(280.0))
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.0))
+                            .children(rows),
+                    );
+                    if let Some(error) = dialog.error.clone() {
+                        card = card.child(
+                            div()
+                                .mt(px(8.0))
+                                .text_size(crate::typography::ui_rems(12.0))
+                                .text_color(theme.danger)
+                                .child(SharedString::from(error)),
+                        );
+                    }
+                }
+            }
+            let confirm_label = if dialog.working { "Compacting…" } else { "Compact" };
+            card = card.child(
+                div()
+                    .mt(px(16.0))
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .gap(px(8.0))
+                    .child(
+                        popover::btn_ghost(&theme, "Cancel", "compact-cancel")
+                            .id("compact-cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.compact_dialog = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        popover::btn_primary(&theme, confirm_label)
+                            .id("compact-confirm")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.confirm_compact(cx)
+                            })),
+                    ),
+            );
+            overlays.push(popover::modal("compact-dialog", viewport, card.into_any_element()));
+        }
+
+        if let Some(dialog) = self.cli_dialog.clone() {
+            let agent = match dialog.harness {
+                HarnessId::Opencode => "OpenCode",
+                HarnessId::Droid => "Droid",
+                _ => "agent",
+            };
+            let card = popover::dialog_card(&theme)
+                .child(popover::dialog_title(&theme, "Open in agent terminal"))
+                .child(div().mt(px(6.0)).child(popover::dialog_body(
+                    &theme,
+                    "Resume this session in the agent's own terminal. Same session, same folder — pick it up wherever you left it.",
+                )))
+                .child(
+                    div()
+                        .mt(px(10.0))
+                        .px(px(10.0))
+                        .py(px(8.0))
+                        .rounded(px(6.0))
+                        .bg(theme.glass_hover())
+                        .text_size(crate::typography::ui_rems(12.5))
+                        .text_color(theme.text)
+                        .child(SharedString::from(dialog.command.clone())),
+                )
+                .child(
+                    div()
+                        .mt(px(8.0))
+                        .text_size(crate::typography::ui_rems(11.5))
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(format!(
+                            "{agent} · session {} · {}",
+                            dialog.session_id, dialog.cwd
+                        ))),
+                )
+                .child(
+                    div()
+                        .mt(px(16.0))
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap(px(8.0))
+                        .child(
+                            popover::btn_ghost(&theme, "Copy", "cli-dialog-copy")
+                                .id("cli-dialog-copy")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.copy_cli_command(window, cx)
+                                })),
+                        )
+                        .child(
+                            popover::btn_ghost(&theme, "Cancel", "cli-dialog-cancel")
+                                .id("cli-dialog-cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.cli_dialog = None;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            popover::btn_primary(&theme, "Open terminal")
+                                .id("cli-dialog-open")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.open_cli_in_terminal(cx)
+                                })),
+                        ),
+                );
+            overlays.push(popover::modal("cli-dialog", viewport, card.into_any_element()));
         }
 
         if let Some(flow) = self.discard_working_tree.clone() {
@@ -13666,6 +14100,27 @@ impl Render for Shell {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cli_buttons_cover_exactly_the_managed_harnesses() {
+        use zeron_proto::HarnessId::*;
+        assert!(cli_managed(Opencode));
+        assert!(cli_managed(Droid));
+        for other in [
+            ClaudeCode, Codex, Cursor, Devin, Grok, Hermes, Pi, Antigravity, Mock,
+        ] {
+            assert!(!cli_managed(other), "{other:?} must not get the buttons");
+        }
+        assert_eq!(
+            cli_resume_command(Opencode, "ses_1").as_deref(),
+            Some("opencode --session ses_1")
+        );
+        assert_eq!(
+            cli_resume_command(Droid, "abc").as_deref(),
+            Some("droid --resume abc")
+        );
+        assert_eq!(cli_resume_command(Codex, "x"), None);
+    }
+
     pub(super) fn chat_with_path(
         cwd: Option<&str>,
         source: Option<(&str, &str)>,
@@ -13783,16 +14238,22 @@ mod tests {
 
     #[test]
     fn update_strip_labels_cover_every_install_kind() {
-        // Managed (curl|sh daemon layout), stock: one click applies the
-        // headless release (stage + swap + service restart).
+        // Managed (curl|sh daemon layout), stock: the click path depends on
+        // whether the install self-updates in place (upstream counts Linux
+        // managed installs as desktop-updateable; elsewhere the engine's
+        // `ApplyUpdate` stages the headless release + restarts the service).
         let managed = zeron_update::InstallKind::Managed {
             app_root: PathBuf::from("/home/u/.zeron/app"),
         };
         let stock = Shell::update_strip_label(&managed, &UpdateFlow::Idle, "0.2.86", false);
-        assert_eq!(
-            stock.0,
-            SharedString::from("Update available — v0.2.86 · click to update")
-        );
+        if managed.supports_desktop_update() {
+            assert_eq!(stock.0, SharedString::from("Update available — v0.2.86"));
+        } else {
+            assert_eq!(
+                stock.0,
+                SharedString::from("Update available — v0.2.86 · click to update")
+            );
+        }
         assert!(stock.1);
         assert_eq!(
             Shell::update_strip_label(&managed, &UpdateFlow::Applying, "0.2.86", false).0,
@@ -13801,14 +14262,23 @@ mod tests {
         assert!(
             !Shell::update_strip_label(&managed, &UpdateFlow::Applying, "0.2.86", false).1
         );
-        // Managed, fork build: applying stock would clobber the fork — the
-        // strip drafts a rebase session instead.
+        // Managed, fork build offered stock: applying it would clobber the
+        // fork — the strip drafts a rebase session instead, on every install
+        // kind (the guard runs before the desktop branch).
         let fork = Shell::update_strip_label(&managed, &UpdateFlow::Idle, "0.2.86", true);
         assert_eq!(
             fork.0,
             SharedString::from("Update available — v0.2.86 · click to draft update session")
         );
         assert!(fork.1);
+        let mac_app = zeron_update::InstallKind::MacApp {
+            bundle: PathBuf::from("/Applications/Zeron.app"),
+        };
+        let fork_mac = Shell::update_strip_label(&mac_app, &UpdateFlow::Idle, "0.2.86", true);
+        assert_eq!(
+            fork_mac.0,
+            SharedString::from("Update available — v0.2.86 · click to draft update session")
+        );
         // The drafted prompt carries the target version and the runbook.
         let prompt = Shell::fork_rebase_prompt("0.2.101");
         assert!(prompt.contains("v0.2.101"), "prompt names the target");
@@ -13818,14 +14288,21 @@ mod tests {
             prompt.contains("Do not push"),
             "prompt withholds pushing by default"
         );
-        // Managed, fork build offered a `-mael.N` release: one-click apply,
-        // like stock managed (staging is fork-aware).
+        // Managed, fork build offered a `-mael.N` release: the normal flow
+        // (one-click apply; staging is fork-aware).
         let fork_release =
             Shell::update_strip_label(&managed, &UpdateFlow::Idle, "0.2.96-mael.2", true);
-        assert_eq!(
-            fork_release.0,
-            SharedString::from("Update available — v0.2.96-mael.2 · click to update")
-        );
+        if managed.supports_desktop_update() {
+            assert_eq!(
+                fork_release.0,
+                SharedString::from("Update available — v0.2.96-mael.2")
+            );
+        } else {
+            assert_eq!(
+                fork_release.0,
+                SharedString::from("Update available — v0.2.96-mael.2 · click to update")
+            );
+        }
         assert!(fork_release.1);
         // Unmanaged (source builds, hand-copied binaries — bare Windows
         // release exes): the GitHub releases page, clickable to open it.

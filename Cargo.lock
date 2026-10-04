@@ -13198,7 +13198,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-voice"
-version = "0.2.102"
+version = "0.2.102-mael.3"
 dependencies = [
  "anyhow",
  "cpal",

@@ -62,6 +62,12 @@ pub mod methods {
     /// Drop a user message and everything after it, and the agent's provider
     /// session with it. Params `{chatId, messageId}`; runs on the chat's host.
     pub const REWIND_CHAT: &str = "RewindChat";
+    /// Compact the agent's context for an OpenCode or Droid chat.
+    /// Params `{chatId, model?}`; runs on the chat's host. OpenCode compacts
+    /// natively (the model, when given, is applied to the session first —
+    /// compaction uses the session's model); Droid queues a `/compress` turn
+    /// with the model's chat config. Refused while a turn is in flight.
+    pub const COMPACT_CHAT: &str = "CompactChat";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
     /// Explicit user navigation, `{chatId}`. Prioritizes this device's sync
     /// connection; automatic subscriptions and retries must not call it.

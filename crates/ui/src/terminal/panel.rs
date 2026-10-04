@@ -475,6 +475,14 @@ impl TerminalPanel {
         Some(self.tab_seq)
     }
 
+    /// Open a tab for an explicit chat (the open-in-CLI dialog's chat, which
+    /// may differ from the selection). Mirrors [`Self::open_tab_for_selected`].
+    pub fn open_tab_for_chat(&mut self, chat: String, cx: &mut Context<Self>) -> Option<u64> {
+        self.open_tab(chat, cx);
+        self.request_focus(cx);
+        Some(self.tab_seq)
+    }
+
     /// Create a named placeholder tab without opening a PTY. Project Actions
     /// use this before their host-side run RPC completes.
     pub fn reserve_tab_for_chat(
@@ -876,6 +884,22 @@ impl TerminalPanel {
     }
 
     // ---- input ----
+
+    /// Queue bytes into a specific tab's input coalescer. The flush pumps
+    /// them once the PTY exists, so this is safe to call before
+    /// OpenTerminal resolves — the "open this session in a terminal"
+    /// button types the resume command into a fresh tab this way.
+    pub fn write_to_tab(&mut self, chat: &str, key: u64, bytes: &[u8], cx: &mut Context<Self>) {
+        let Some(tab) = self.tab_mut(chat, key) else {
+            return;
+        };
+        if tab.exited.is_some() {
+            return;
+        }
+        if tab.coalescer.push(bytes) {
+            tab.flush_task = Some(Self::schedule_flush(chat.to_owned(), key, cx));
+        }
+    }
 
     /// Queue keyboard bytes on the active tab (12 ms coalescing window).
     fn queue_input(&mut self, bytes: &[u8], cx: &mut Context<Self>) {

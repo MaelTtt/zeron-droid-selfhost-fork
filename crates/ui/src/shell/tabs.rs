@@ -48,6 +48,9 @@ struct PanelTitlebarWidths {
 /// row gap they cost the project-actions control.
 const SESSION_CONTROLS_WIDTH: f32 = 28.0 * 2.0 + 2.0 + 8.0;
 
+/// The compact + open-in-terminal buttons for OpenCode/Droid chats.
+const SESSION_CLI_CONTROLS_WIDTH: f32 = 28.0 * 2.0 + 2.0 + 8.0;
+
 /// The two fixed right-edge anchors: the explorer toggle and the pane toggle
 /// (28px each) with the same 4px gap the surface strip keeps between its
 /// controls, so the two never render as one fused block.
@@ -109,6 +112,8 @@ impl Shell {
         self.overlay_owns_keyboard(cx)
             || self.sync_flow.has_visible_overlay()
             || self.delete_confirm.is_some()
+            || self.compact_dialog.is_some()
+            || self.cli_dialog.is_some()
             || self.delete_space_confirm.is_some()
             || self.chat_rename.is_some()
             || self.rename_space_dialog.is_some()
@@ -552,11 +557,48 @@ impl Shell {
                     .when(busy, |el| el.opacity(0.4)),
                 )
         });
-        let available_titlebar_width = if session_controls.is_some() {
-            (available_titlebar_width - SESSION_CONTROLS_WIDTH).max(0.0)
-        } else {
-            available_titlebar_width
-        };
+        // Compact + open-in-terminal for the harnesses that support them
+        // (OpenCode compacts natively; Droid runs /compress; both resume in
+        // their own CLI).
+        let cli_actions =
+            (!takeover && !on_canvas && harness.is_some_and(cli_managed)).then(|| {
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(2.0))
+                    .child(
+                        header_icon_button(
+                            "session-compact",
+                            icons::FOLD_VERTICAL,
+                            "Compact conversation",
+                            &theme,
+                            cx.listener(|this, _, _, cx| this.open_compact_dialog(cx)),
+                        )
+                        .role(gpui::Role::Button)
+                        .aria_label("Compact conversation"),
+                    )
+                    .child(
+                        header_icon_button(
+                            "session-open-cli",
+                            icons::TERMINAL,
+                            "Open in agent terminal",
+                            &theme,
+                            cx.listener(|this, _, _, cx| this.open_cli_dialog(cx)),
+                        )
+                        .role(gpui::Role::Button)
+                        .aria_label("Open in agent terminal"),
+                    )
+            });
+        let mut available_titlebar_width = available_titlebar_width;
+        if session_controls.is_some() {
+            available_titlebar_width = (available_titlebar_width - SESSION_CONTROLS_WIDTH).max(0.0);
+        }
+        if cli_actions.is_some() {
+            available_titlebar_width =
+                (available_titlebar_width - SESSION_CLI_CONTROLS_WIDTH).max(0.0);
+        }
         let actions = (!takeover && !on_canvas)
             .then(|| {
                 self.render_project_actions_control(available_titlebar_width, viewport_height, cx)
@@ -619,6 +661,7 @@ impl Shell {
                 )
             })
             .child(div().flex_1())
+            .children(cli_actions)
             .children(session_controls)
             .children(actions)
             .children(trailing);
