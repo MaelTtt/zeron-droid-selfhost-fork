@@ -163,7 +163,8 @@ pub struct EngineCore {
     pub device_id: String,
     /// Which app windows are focused (desktop banners hold back while one is).
     pub viewport_focus: desktop_notify::ViewportFocus,
-    /// Local→synced profile import (account-scoped runtimes only).
+    /// Local→account profile import (synced and development runtimes only;
+    /// the local profile is the import source).
     pub local_import: Option<local_import::LocalImporter>,
     workspace_scope: WorkspaceScope,
     /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
@@ -327,7 +328,17 @@ impl EngineCore {
             agent_accounts_config.codex_home.clone()
         };
         sessions.set_generated_images(uploads.clone(), codex_home.join("generated_images"));
-        let local_import = (profile.scope() == WorkspaceScope::Synced).then(|| {
+        // Account-scoped runtimes (synced AND development) can adopt chats
+        // from a previous local-profile stretch: both share the
+        // `orgs/{org}/{user}` layout and the per-(org, user) marker, so a
+        // Local→Development move (e.g. starting a self-hosted headless
+        // daemon) no longer strands chats with no import path. The local
+        // profile itself is the import source and never gets an importer.
+        let local_import = matches!(
+            profile.scope(),
+            WorkspaceScope::Synced | WorkspaceScope::Development
+        )
+        .then(|| {
             local_import::LocalImporter::new(
                 data_dir,
                 &device_id,
