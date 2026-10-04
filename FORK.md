@@ -11,8 +11,9 @@ releases.
 | 9c1673d6 | **Factory Droid as a first-class ACP harness** — `droid exec --output-format acp`, live model discovery, autonomy wiring | upstream PR #372 (rebased) |
 | 30df737d | Droid permission level persistence in the model picker | upstream PR #372 |
 | 8014e64d | **Self-host the edge with `AUTH_MODE=none`** — Docker edge relay (`docker-compose.selfhost.yml`, `edge/Dockerfile`, `edge/wrangler.selfhost.jsonc`, `docs/SELFHOST.md`); the engine accepts your own `ZERON_EDGE_URL` with no WorkOS/Zeron account | upstream PR #317 |
-| ba470911 | **Fork identity** — version `0.2.96-mael.2`; `zeron update` refuses to overwrite the fork with *stock* while `ZERON_FORK` is set (points at `zeron-fork-update`), but one-click applies `-mael.N` releases from the fork feed (fork-aware staging into `fork-<version>/`); background auto-update disabled; `zeron status` shows the fork line | mael |
+| ba470911 | **Fork identity** — version `0.2.102-mael.3` (upstream base v0.2.102); `zeron update` refuses to overwrite the fork with *stock* while `ZERON_FORK` is set (points at `zeron-fork-update`), but one-click applies `-mael.N` releases from the fork feed (fork-aware staging into `fork-<version>/`); background auto-update disabled; `zeron status` shows the fork line | mael |
 | — | **Rewind** — rewind button in the hover strip under each sent message (click twice to confirm) plus double-Escape prompt list. For Droid and OpenCode chats it truncates the transcript from that message and drops the agent's session (`RewindChat` RPC); the next run starts a fresh session bootstrapped with the remaining transcript. Files are not reverted. Other harnesses only get the prompt text back | upstream PR #384 + mael |
+| — | **Compact + open-in-CLI titlebar buttons** (OpenCode/Droid chats only) — compact opens a model picker then `CompactChat`: OpenCode compacts through its own API (picked model applied to the session first, since compaction uses the session's model), Droid queues a `/compress` turn. The terminal button shows the native resume command (`opencode --session <id>` / `droid --resume <id>`) with copy + one-click run in a fresh embedded terminal tab | mael |
 | 0502fe67 | 0.2.86 surface adaptation of the droid harness (install methods, skills dirs, spec fields, registry descriptor, auth test API) | mael |
 | 1f691a9c | **One-click update strip + droid fallback chip** — managed installs apply headless releases from the sidebar strip (`ApplyUpdate`: stage + swap + service restart, with updating/failed states); a fork build applies `-mael.N` releases from the fork feed the same way (fork-aware staging) and opens a fresh session with the rebase runbook prefilled for *stock* releases (which would clobber the fork); ACP `config_option_update` model changes surface as an amber "Model switched" transcript chip (Droid's quota fallback onto its core models) | mael |
 
@@ -22,7 +23,7 @@ When upstream #372 merges, the rebase will naturally drop what upstream already 
 
 ## Versioning
 
-- Fork version = `<upstream version>-mael.<n>` (currently `0.2.96-mael.2`), tag
+- Fork version = `<upstream version>-mael.<n>` (currently `0.2.102-mael.3`), tag
   `mael/v<version>` on `main`.
 - `version_newer` compares numeric cores first; on equal cores a higher
   `-mael.N` counts as newer **only when the installed build is itself a
@@ -42,8 +43,8 @@ homelab edge):
 
 ```bash
 # 1. Bump [workspace.package] version in Cargo.toml:
-#    numeric core and/or -mael.N must grow (mael.2 > mael.1 counts, but
-#    0.2.96-mael.1 does NOT supersede 0.2.96 — see version_newer above).
+#    numeric core and/or -mael.N must grow (mael.3 > mael.2 counts, but
+#    0.2.102-mael.2 does NOT supersede 0.2.102 — see version_newer above).
 # 2. Commit, tag mael/v<version>, push main.
 # 3. Build + stage the release metadata:
 scripts/publish-fork-release.sh            # or --skip-build to reuse tarballs
@@ -107,8 +108,8 @@ compiles).
 
 ## Gotchas
 
-- The fork's engine *code* is upstream 0.2.96 + the patches; the version string is only a
-  display identity. Wire-protocol sync with official devices is unchanged (same 0.2.96 code).
+- The fork's engine *code* is upstream 0.2.102 + the patches; the version string is only a
+  display identity. Wire-protocol sync with official devices is unchanged (same 0.2.102 code).
 - Never run stock `zeron update` while the fork is installed: the fork's own guard refuses the
   self-overwrite, but if an official binary ever got swapped in externally, `zeron-fork-update`
   restores the fork cleanly.

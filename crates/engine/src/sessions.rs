@@ -462,6 +462,18 @@ impl SessionsEngine {
             .is_some_and(HarnessDescriptor::steers_mid_turn)
     }
 
+    /// Harness-native session id to resume for `chat_id` launching from
+    /// `cwd` (the compact lookup). Cwd-gated like dispatch: a session
+    /// created elsewhere never rides along.
+    pub fn harness_session_for(
+        &self,
+        chat_id: &str,
+        cwd: &str,
+        harness: HarnessId,
+    ) -> Option<String> {
+        self.inner.harness_session_for(chat_id, cwd, harness)
+    }
+
     /// Whether this chat has a turn in flight — streaming, or parked on a
     /// question it is still owed an answer to (see [`is_active`]). A persistent
     /// session parked BETWEEN turns is not: it holds a warm child with nothing
@@ -2254,6 +2266,18 @@ impl Inner {
     // yields a fresh session whose SessionStarted overwrites the row. The
     // one in-memory tombstone left is the startup-crash retry's, set only
     // when the provider itself says the session is gone (`resume_rejected`).
+
+    /// Harness-native session id to resume for `chat_id` launching from
+    /// `cwd` (the compact lookup). Cwd-gated like dispatch: a session
+    /// created elsewhere never rides along.
+    fn harness_session_for(
+        &self,
+        chat_id: &str,
+        cwd: &str,
+        harness: HarnessId,
+    ) -> Option<String> {
+        self.resume_for(chat_id, cwd, harness)
+    }
 
     /// The session id to resume for a run of `harness` in `chat_id` launching
     /// from `cwd` (zeron sessions.ts:736, looked up on every dispatch):
