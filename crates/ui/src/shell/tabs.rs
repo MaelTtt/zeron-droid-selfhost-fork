@@ -118,6 +118,8 @@ impl Shell {
         self.overlay_owns_keyboard(cx)
             || self.sync_flow.has_visible_overlay()
             || self.delete_confirm.is_some()
+            || self.compact_dialog.is_some()
+            || self.cli_dialog.is_some()
             || self.delete_space_confirm.is_some()
             || self.chat_rename.is_some()
             || self.rename_space_dialog.is_some()
@@ -576,6 +578,40 @@ impl Shell {
             )
         };
 
+        // Compact + open-in-terminal for the harnesses that support them
+        // (OpenCode compacts natively; Droid runs /compress; both resume in
+        // their own CLI).
+        let cli_actions =
+            (!takeover && !on_canvas && harness.is_some_and(cli_managed)).then(|| {
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(2.0))
+                    .child(
+                        header_icon_button(
+                            "session-compact",
+                            icons::FOLD_VERTICAL,
+                            "Compact conversation",
+                            &theme,
+                            cx.listener(|this, _, _, cx| this.open_compact_dialog(cx)),
+                        )
+                        .role(gpui::Role::Button)
+                        .aria_label("Compact conversation"),
+                    )
+                    .child(
+                        header_icon_button(
+                            "session-open-cli",
+                            icons::TERMINAL,
+                            "Open in agent terminal",
+                            &theme,
+                            cx.listener(|this, _, _, cx| this.open_cli_dialog(cx)),
+                        )
+                        .role(gpui::Role::Button)
+                        .aria_label("Open in agent terminal"),
+                    )
+            });
         // The session card's toggle belongs to the transcript: it ends the
         // transcript's stretch of the titlebar, left of the side pane's tabs
         // when one is open, else just left of the explorer toggle.
@@ -645,6 +681,7 @@ impl Shell {
                 )
             })
             .child(div().flex_1())
+            .children(cli_actions)
             .children(session_info_toggle)
             .children(trailing);
 
