@@ -223,6 +223,53 @@ async fn local_work_imports_into_synced_profile_once() {
 }
 
 #[tokio::test]
+async fn local_work_imports_into_development_profile_too() {
+    // Regression: a Local→Development move (e.g. starting a self-hosted
+    // headless daemon, which assembles the dev-org/dev-user profile) used to
+    // strand local chats with no import path at all — the importer only
+    // existed on synced runtimes. Development shares the account-scoped
+    // `orgs/{org}/{user}` layout, so it must carry an importer as well.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_device, chat_doc, _chat_bare) = seed_local(dir.path()).await;
+
+    let dev = assemble(EngineProfile::development(dir.path(), "dev-org", "dev-user"));
+    let status = dev
+        .local_import
+        .as_ref()
+        .expect("development runtime importer")
+        .status()
+        .expect("status");
+    assert_eq!(status.available_chats, 2);
+    assert_eq!(status.available_spaces, 1);
+
+    let events = run_import(&dev);
+    let (imported_chats, imported_spaces, skipped_chats, skipped_spaces) = summary(&events);
+    assert_eq!((imported_chats, imported_spaces), (2, 1));
+    assert_eq!((skipped_chats, skipped_spaces), (0, 0));
+
+    let row = dev
+        .workspace
+        .chat(&chat_doc)
+        .expect("read chat")
+        .expect("imported chat row");
+    assert_eq!(row.title.as_deref(), Some("Fix the flaky test"));
+    assert_eq!(row.room_gen, Some(2), "imported chats must be chat2-born");
+
+    // The local profile itself is the import source and never self-imports
+    // (fresh dir: assembling two engines on one data dir would trip the
+    // single-instance lock).
+    let other = tempfile::tempdir().expect("tempdir");
+    let local = assemble(EngineProfile::local(other.path()).expect("local profile"));
+    assert!(
+        local.local_import.is_none(),
+        "local runtime must not carry an importer"
+    );
+
+    dev.shutdown().await;
+    local.shutdown().await;
+}
+
+#[tokio::test]
 async fn import_without_local_profile_is_a_clean_no_op() {
     let dir = tempfile::tempdir().expect("tempdir");
     let synced = assemble(EngineProfile::synced(dir.path(), "org1", "user1"));
