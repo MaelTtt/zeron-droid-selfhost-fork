@@ -113,8 +113,6 @@ impl Shell {
         self.overlay_owns_keyboard(cx)
             || self.sync_flow.has_visible_overlay()
             || self.delete_confirm.is_some()
-            || self.compact_dialog.is_some()
-            || self.cli_dialog.is_some()
             || self.delete_space_confirm.is_some()
             || self.chat_rename.is_some()
             || self.rename_space_dialog.is_some()
@@ -575,7 +573,7 @@ impl Shell {
                             icons::FOLD_VERTICAL,
                             "Compact conversation",
                             &theme,
-                            cx.listener(|this, _, _, cx| this.open_compact_dialog(cx)),
+                            cx.listener(|this, _, window, cx| this.open_compact_picker(window, cx)),
                         )
                         .role(gpui::Role::Button)
                         .aria_label("Compact conversation"),
@@ -586,7 +584,7 @@ impl Shell {
                             icons::TERMINAL,
                             "Open in agent terminal",
                             &theme,
-                            cx.listener(|this, _, _, cx| this.open_cli_dialog(cx)),
+                            cx.listener(|this, _, _, cx| this.open_cli_in_terminal(cx)),
                         )
                         .role(gpui::Role::Button)
                         .aria_label("Open in agent terminal"),

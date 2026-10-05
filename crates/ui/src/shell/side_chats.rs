@@ -237,6 +237,9 @@ impl Shell {
                         } => transcript.update(cx, |t, cx| {
                             t.on_own_queued_send(chat_id.clone(), message_id.clone(), cx)
                         }),
+                        // Compact is armed on the main composer only; a side
+                        // chat's picker never emits this.
+                        ComposerEvent::CompactModelPicked { .. } => {}
                     }
                 }
             }),

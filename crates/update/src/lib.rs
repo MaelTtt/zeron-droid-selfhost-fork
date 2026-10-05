@@ -369,6 +369,187 @@ pub const RELEASES_PAGE: &str = "https://github.com/zeronsh/zeron/releases";
 /// installation cannot replace itself.
 pub const LATEST_RELEASE_PAGE: &str = "https://github.com/zeronsh/zeron/releases/latest";
 
+/// Default GitHub repo serving fork (`-mael.N`) releases. Override with
+/// `ZERON_FORK_REPO=owner/repo` when the fork lives elsewhere.
+pub fn fork_repo() -> String {
+    std::env::var("ZERON_FORK_REPO")
+        .ok()
+        .map(|v| v.trim().trim_matches('/').to_owned())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "MaelTtt/zeron-droid-selfhost-fork".to_owned())
+}
+
+/// The fork's GitHub releases page — where fork installs land when they
+/// cannot replace themselves.
+pub fn fork_releases_page() -> String {
+    format!("https://github.com/{}/releases", fork_repo())
+}
+
+/// A fork release resolved to something installable: its manifest plus the
+/// base URL its artifacts download from (a GitHub release download prefix
+/// or an `{edge}/releases` feed).
+#[derive(Debug, Clone)]
+pub struct ResolvedUpdate {
+    pub manifest: Manifest,
+    pub download_base: String,
+}
+
+/// Strip a release tag down to its version: `mael/v0.2.102-mael.4` and
+/// `v0.2.102-mael.4` both mean `0.2.102-mael.4`. Returns `None` for tags
+/// that are not fork releases.
+fn fork_tag_version(tag: &str) -> Option<String> {
+    let version = tag
+        .strip_prefix("mael/v")
+        .or_else(|| tag.strip_prefix("mael/"))
+        .unwrap_or(tag);
+    let version = version.strip_prefix('v').unwrap_or(version);
+    is_fork_version(version).then(|| version.to_owned())
+}
+
+/// Pick the newest fork (`-mael.N`) release newer than `current` from a
+/// GitHub releases API payload. Drafts are skipped; `mael/v<ver>` prefixes
+/// are stripped before the fork-version check, so a stock `vX.Y.Z` tag
+/// never resolves here.
+fn pick_fork_release(
+    releases: &[serde_json::Value],
+    current: &str,
+) -> Option<(String, String)> {
+    let mut best: Option<(String, String)> = None; // (version, tag)
+    for release in releases {
+        if release
+            .get("draft")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let Some(tag) = release.get("tag_name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(version) = fork_tag_version(tag) else {
+            continue;
+        };
+        if !version_newer(&version, current) {
+            continue;
+        }
+        let is_newer = match &best {
+            Some((best_version, _)) => version_newer(&version, best_version),
+            None => true,
+        };
+        if is_newer {
+            best = Some((version, tag.to_string()));
+        }
+    }
+    best
+}
+
+/// The newest fork (`-mael.N`) release on the fork's GitHub repo newer than
+/// this build, or `None` when there is none.
+///
+/// Discovery is via the public GitHub releases API (no auth;
+/// `ZERON_GITHUB_TOKEN` raises the rate limit when set); checksums come from
+/// the release's `manifest.json` asset when present, otherwise the manifest
+/// carries no files (the download proceeds unverified with a warning — the
+/// pre-manifest fallback).
+pub async fn fetch_github_fork_latest() -> anyhow::Result<Option<ResolvedUpdate>> {
+    fetch_github_fork_latest_for(current_version()).await
+}
+
+async fn fetch_github_fork_latest_for(current: &str) -> anyhow::Result<Option<ResolvedUpdate>> {
+    let repo = fork_repo();
+    let client = http_client()?;
+    let api_url = format!("https://api.github.com/repos/{repo}/releases?per_page=20");
+    let mut request = client
+        .get(&api_url)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "zeron-fork-updater");
+    if let Ok(token) = std::env::var("ZERON_GITHUB_TOKEN")
+        && !token.trim().is_empty()
+    {
+        request = request.bearer_auth(token.trim());
+    }
+    let response = request.send().await.context("fetching fork releases")?;
+    if !response.status().is_success() {
+        bail!("fetching fork releases: HTTP {}", response.status());
+    }
+    let releases: Vec<serde_json::Value> =
+        response.json().await.context("parsing fork releases")?;
+    let Some((version, tag)) = pick_fork_release(&releases, current) else {
+        return Ok(None);
+    };
+    // Tags never contain `/` (`v<version>`), so the download prefix is a
+    // plain path segment below the release.
+    let base = format!(
+        "https://github.com/{}/releases/download/{}",
+        repo.trim().trim_matches('/'),
+        tag
+    );
+    // Prefer the release's own manifest.json (sha256 map); fall back to a
+    // bare version when the asset is missing.
+    match fetch_release_metadata(&client, &format!("{base}/manifest.json")).await {
+        Ok(resp) if resp.status.is_success() => {
+            match serde_json::from_slice::<Manifest>(&resp.body) {
+                Ok(manifest) if !manifest.version.trim().is_empty() => Ok(Some(ResolvedUpdate {
+                    manifest,
+                    download_base: base,
+                })),
+                _ => Ok(Some(ResolvedUpdate {
+                    manifest: Manifest {
+                        version,
+                        files: BTreeMap::new(),
+                    },
+                    download_base: base,
+                })),
+            }
+        }
+        _ => Ok(Some(ResolvedUpdate {
+            manifest: Manifest {
+                version,
+                files: BTreeMap::new(),
+            },
+            download_base: base,
+        })),
+    }
+}
+
+/// The newest fork release visible from this device: the newer of the edge
+/// `{edge}/releases` feed (homelab bucket) and the fork's GitHub releases —
+/// provided it is a `-mael.N` version newer than this build. Stock versions
+/// never resolve here: a fork install is never nagged toward official
+/// releases, so the update button only ever offers the personal fork.
+pub async fn fetch_fork_update(edge_url: &str) -> anyhow::Result<Option<ResolvedUpdate>> {
+    let current = current_version();
+    let mut best: Option<ResolvedUpdate> = None;
+    if let Ok(manifest) = fetch_latest(edge_url).await
+        && is_fork_version(&manifest.version)
+        && version_newer(&manifest.version, current)
+    {
+        let base = release_base(edge_url).unwrap_or_else(|_| {
+            format!("{}/releases", edge_url.trim_end_matches('/'))
+        });
+        best = Some(ResolvedUpdate {
+            manifest,
+            download_base: base,
+        });
+    }
+    match fetch_github_fork_latest().await {
+        Ok(Some(github)) => {
+            let newer = match &best {
+                Some(existing) => {
+                    version_newer(&github.manifest.version, &existing.manifest.version)
+                }
+                None => true,
+            };
+            if newer && version_newer(&github.manifest.version, current) {
+                best = Some(github);
+            }
+        }
+        Ok(None) => {}
+        Err(err) => tracing::debug!(error = %err, "fork GitHub release check failed"),
+    }
+    Ok(best)
+}
+
 fn release_base(edge_url: &str) -> anyhow::Result<String> {
     if let Ok(url) = std::env::var("ZERON_RELEASES_URL")
         && !url.trim().is_empty()
@@ -459,6 +640,22 @@ impl InstallKind {
                 (!dir_writable(directory)).then(|| UpdateBlocker::NotWritable(directory.clone()))
             }
             Self::Unmanaged => None,
+        }
+    }
+
+    /// Stage a resolved fork (`-mael.N`) release from its own download base
+    /// (a GitHub release download prefix or an edge feed). Managed installs
+    /// only — the fork ships Linux headless builds.
+    pub async fn stage_fork_desktop(
+        &self,
+        manifest: &Manifest,
+        download_base: &str,
+    ) -> anyhow::Result<PathBuf> {
+        match self {
+            Self::Managed { app_root } if self.supports_desktop_update() => {
+                stage_headless_from_base(download_base, manifest, app_root).await
+            }
+            _ => bail!("this installation does not support fork desktop updates"),
         }
     }
 
@@ -646,7 +843,19 @@ pub async fn download_release_file(
     file: &str,
     dest: &Path,
 ) -> anyhow::Result<()> {
-    let url = format!("{}/{file}", release_base(edge_url)?);
+    download_release_file_from_base(&release_base(edge_url)?, manifest, file, dest).await
+}
+
+/// Same as [`download_release_file`], but against an explicit download base
+/// (a GitHub release download prefix for fork one-click updates) instead of
+/// an edge feed URL.
+pub async fn download_release_file_from_base(
+    download_base: &str,
+    manifest: &Manifest,
+    file: &str,
+    dest: &Path,
+) -> anyhow::Result<()> {
+    let url = format!("{}/{file}", download_base.trim_end_matches('/'));
     let expected = manifest.files.get(file).and_then(|m| m.sha256.as_deref());
     if expected.is_none() {
         tracing::warn!(
@@ -758,11 +967,32 @@ pub async fn stage_headless(
     manifest: &Manifest,
     app_root: &Path,
 ) -> anyhow::Result<PathBuf> {
-    stage_headless_for(edge_url, manifest, app_root, is_fork_install()).await
+    let base = release_base(edge_url)?;
+    stage_headless_from_base(&base, manifest, app_root).await
+}
+
+/// Same as [`stage_headless`], but downloading from an explicit base URL (a
+/// GitHub release download prefix for fork one-click updates).
+pub async fn stage_headless_from_base(
+    download_base: &str,
+    manifest: &Manifest,
+    app_root: &Path,
+) -> anyhow::Result<PathBuf> {
+    stage_headless_for_base(download_base, manifest, app_root, is_fork_install()).await
 }
 
 async fn stage_headless_for(
     edge_url: &str,
+    manifest: &Manifest,
+    app_root: &Path,
+    fork: bool,
+) -> anyhow::Result<PathBuf> {
+    let base = release_base(edge_url)?;
+    stage_headless_for_base(&base, manifest, app_root, fork).await
+}
+
+async fn stage_headless_for_base(
+    download_base: &str,
     manifest: &Manifest,
     app_root: &Path,
     fork: bool,
@@ -784,7 +1014,7 @@ async fn stage_headless_for(
     std::fs::create_dir_all(&stage).with_context(|| format!("creating {}", stage.display()))?;
     let result = async {
         let tarball = stage.join(&file);
-        download_release_file(edge_url, manifest, &file, &tarball).await?;
+        download_release_file_from_base(download_base, manifest, &file, &tarball).await?;
         let unpacked = stage.join("unpacked");
         std::fs::create_dir_all(&unpacked)?;
         // Tarball root is the versioned stage dir (see scripts/package-linux.sh);
@@ -1268,17 +1498,41 @@ impl Updater {
     }
 
     /// One user-requested check, awaited: publishes the result like a
-    /// scheduled check and returns it.
+    /// scheduled check and returns it. Fork installs resolve the newest
+    /// `-mael.N` release (edge feed or GitHub) instead of the stock feed.
     pub async fn check(&self) -> anyhow::Result<UpdateStatus> {
-        match fetch_latest(&self.edge_url).await {
-            Ok(manifest) => {
-                self.publish(manifest);
-                Ok(self.status_tx.borrow().clone())
+        if is_fork_install() {
+            match fetch_fork_update(&self.edge_url).await {
+                Ok(Some(resolved)) => {
+                    self.publish(resolved.manifest);
+                    Ok(self.status_tx.borrow().clone())
+                }
+                Ok(None) => {
+                    // No newer fork release: report the installed version so
+                    // a stale "update available" clears.
+                    self.publish(Manifest {
+                        version: current_version().to_string(),
+                        files: BTreeMap::new(),
+                    });
+                    Ok(self.status_tx.borrow().clone())
+                }
+                Err(err) => {
+                    self.status_tx
+                        .send_modify(|s| s.error = Some(format!("{err:#}")));
+                    Err(err)
+                }
             }
-            Err(err) => {
-                self.status_tx
-                    .send_modify(|s| s.error = Some(format!("{err:#}")));
-                Err(err)
+        } else {
+            match fetch_latest(&self.edge_url).await {
+                Ok(manifest) => {
+                    self.publish(manifest);
+                    Ok(self.status_tx.borrow().clone())
+                }
+                Err(err) => {
+                    self.status_tx
+                        .send_modify(|s| s.error = Some(format!("{err:#}")));
+                    Err(err)
+                }
             }
         }
     }
@@ -1338,18 +1592,42 @@ impl Updater {
     /// idle→restart gap to well under a second.
     async fn auto_apply_when_idle(&self) {
         if let InstallKind::Managed { app_root } = detect_install() {
-            match fetch_latest(&self.edge_url).await {
-                Ok(manifest) if version_newer(&manifest.version, current_version()) => {
-                    if let Err(err) = stage_headless(&self.edge_url, &manifest, &app_root).await {
-                        tracing::warn!(error = %err, "auto-update staging failed");
+            // Fork installs never reach here (`auto_update_enabled` is false
+            // for forks), but resolve fork-aware anyway so a future policy
+            // change stages from the right feed.
+            let staged = if is_fork_install() {
+                match fetch_fork_update(&self.edge_url).await {
+                    Ok(Some(resolved))
+                        if version_newer(&resolved.manifest.version, current_version()) =>
+                    {
+                        stage_headless_from_base(
+                            &resolved.download_base,
+                            &resolved.manifest,
+                            &app_root,
+                        )
+                        .await
+                    }
+                    Ok(_) => return,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "auto-update staging fetch failed");
                         return;
                     }
                 }
-                Ok(_) => return,
-                Err(err) => {
-                    tracing::warn!(error = %err, "auto-update staging fetch failed");
-                    return;
+            } else {
+                match fetch_latest(&self.edge_url).await {
+                    Ok(manifest) if version_newer(&manifest.version, current_version()) => {
+                        stage_headless(&self.edge_url, &manifest, &app_root).await
+                    }
+                    Ok(_) => return,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "auto-update staging fetch failed");
+                        return;
+                    }
                 }
+            };
+            if let Err(err) = staged {
+                tracing::warn!(error = %err, "auto-update staging failed");
+                return;
             }
         }
         let mut deferred = false;
@@ -1403,18 +1681,43 @@ impl Updater {
         self.status_tx.send_replace(status);
     }
 
-    /// One check; returns false on fetch failure (retry sooner).
+    /// One check; returns false on fetch failure (retry sooner). Fork
+    /// installs resolve the newest `-mael.N` release (edge feed or GitHub)
+    /// instead of the stock feed, so the sidebar strip lights up for fork
+    /// releases pushed from any machine.
     async fn check_once(&self) -> bool {
-        match fetch_latest(&self.edge_url).await {
-            Ok(manifest) => {
-                self.publish(manifest);
-                true
+        if is_fork_install() {
+            match fetch_fork_update(&self.edge_url).await {
+                Ok(Some(resolved)) => {
+                    self.publish(resolved.manifest);
+                    true
+                }
+                Ok(None) => {
+                    self.publish(Manifest {
+                        version: current_version().to_string(),
+                        files: BTreeMap::new(),
+                    });
+                    true
+                }
+                Err(err) => {
+                    tracing::debug!(error = %err, "fork update check failed");
+                    self.status_tx
+                        .send_modify(|s| s.error = Some(format!("{err:#}")));
+                    false
+                }
             }
-            Err(err) => {
-                tracing::debug!(error = %err, "update check failed");
-                self.status_tx
-                    .send_modify(|s| s.error = Some(format!("{err:#}")));
-                false
+        } else {
+            match fetch_latest(&self.edge_url).await {
+                Ok(manifest) => {
+                    self.publish(manifest);
+                    true
+                }
+                Err(err) => {
+                    tracing::debug!(error = %err, "update check failed");
+                    self.status_tx
+                        .send_modify(|s| s.error = Some(format!("{err:#}")));
+                    false
+                }
             }
         }
     }
@@ -1438,11 +1741,23 @@ impl Updater {
                  source builds update via git"
             );
         };
-        let manifest = fetch_latest(&self.edge_url).await?;
+        // Fork installs apply the resolved `-mael.N` release (GitHub or edge
+        // feed) via its own download base; stock keeps the edge feed.
+        let (manifest, download_base) = if is_fork_install() {
+            let Some(resolved) = fetch_fork_update(&self.edge_url).await? else {
+                bail!("already up to date ({})", current_version());
+            };
+            (resolved.manifest, Some(resolved.download_base))
+        } else {
+            (fetch_latest(&self.edge_url).await?, None)
+        };
         if !version_newer(&manifest.version, current_version()) {
             bail!("already up to date ({})", current_version());
         }
-        stage_headless(&self.edge_url, &manifest, &app_root).await?;
+        match download_base {
+            Some(base) => stage_headless_from_base(&base, &manifest, &app_root).await?,
+            None => stage_headless(&self.edge_url, &manifest, &app_root).await?,
+        };
         if require_quiescent && !self.quiescent_now() {
             return Ok(None);
         }
@@ -1789,6 +2104,58 @@ mod tests {
         assert!(!is_fork_version("0.2.96-mael."));
         assert!(!is_fork_version("0.2.96-mael.x"));
         assert!(!is_fork_version("nightly"));
+    }
+
+    #[test]
+    fn fork_release_tags_resolve_to_versions() {
+        // Tags never contain `/` (`v<version>`); the legacy `mael/v` shape
+        // is still accepted so old releases keep resolving.
+        assert_eq!(
+            fork_tag_version("v0.2.102-mael.4").as_deref(),
+            Some("0.2.102-mael.4")
+        );
+        assert_eq!(
+            fork_tag_version("mael/v0.2.102-mael.4").as_deref(),
+            Some("0.2.102-mael.4")
+        );
+        assert_eq!(fork_tag_version("v0.2.102"), None);
+        assert_eq!(fork_tag_version("0.2.102"), None);
+        assert_eq!(fork_tag_version("nightly"), None);
+    }
+
+    #[test]
+    fn fork_release_picker_prefers_the_newest_newer_release() {
+        fn rel(tag: &str, draft: bool) -> serde_json::Value {
+            serde_json::json!({ "tag_name": tag, "draft": draft })
+        }
+        // Drafts, stock tags, and releases at or below current are skipped;
+        // the newest newer `-mael.N` wins.
+        let releases = vec![
+            rel("v0.2.103", false),          // stock: never a fork update
+            rel("v0.2.102-mael.5", true),    // draft: skipped
+            rel("v0.2.102-mael.2", false),   // current: not newer
+            rel("v0.2.102-mael.4", false),   // newest fork: wins
+            rel("v0.2.102-mael.3", false),   // older fork
+            rel("mael/v0.2.102-mael.1", false), // legacy prefix still resolves
+        ];
+        assert_eq!(
+            pick_fork_release(&releases, "0.2.102-mael.2"),
+            Some((
+                "0.2.102-mael.4".to_string(),
+                "v0.2.102-mael.4".to_string()
+            ))
+        );
+        // Nothing newer: no update.
+        assert_eq!(pick_fork_release(&releases, "0.2.102-mael.4"), None);
+        // A newer numeric core still wins regardless of suffix.
+        let releases = vec![rel("v0.2.103-mael.1", false)];
+        assert_eq!(
+            pick_fork_release(&releases, "0.2.102-mael.9"),
+            Some((
+                "0.2.103-mael.1".to_string(),
+                "v0.2.103-mael.1".to_string()
+            ))
+        );
     }
 
     #[test]

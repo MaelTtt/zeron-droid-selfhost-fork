@@ -501,6 +501,16 @@ pub struct TitleModelPicked(pub TitleSettings);
 
 impl gpui::EventEmitter<TitleModelPicked> for Pickers {}
 
+/// A model picked as the summarizer for a compact request: the pick must NOT
+/// rewrite the chat's active model — the owner runs `CompactChat` with it.
+#[derive(Clone, Debug)]
+pub struct CompactModelPicked {
+    pub chat_id: String,
+    pub model_id: String,
+}
+
+impl gpui::EventEmitter<CompactModelPicked> for Pickers {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ModelSetting {
     Reasoning,
@@ -572,6 +582,10 @@ pub struct Pickers {
     /// emits the local device's title settings instead of a composer draft.
     /// `config.harness` then only tracks the tab being browsed.
     title: Option<TitleSettings>,
+    /// Compact target: while set, the next model pick is routed to
+    /// [`CompactModelPicked`] instead of rewriting the chat/draft model.
+    /// Cleared on pick or dismiss so normal picking resumes.
+    compact_chat: Option<String>,
     /// Sticky last-used picks (zeron `zeron.composer.defaults:v1`): seeds the
     /// new-chat chips and is rewritten on every new-chat pick.
     defaults: ComposerDefaults,
@@ -838,6 +852,7 @@ impl Pickers {
             effort_bounds: None,
             config: DraftConfig::default(),
             title,
+            compact_chat: None,
             defaults,
             data_dir,
             draft_owner,
@@ -1185,6 +1200,7 @@ impl Pickers {
 
     /// Outside clicks and navigation keep focus at the clicked destination.
     fn dismiss(&mut self, cx: &mut Context<Self>) {
+        self.compact_chat = None;
         self.focus_on_mount = false;
         self.effort_dragging = false;
         self.cancel_setting_hover();
@@ -1223,6 +1239,23 @@ impl Pickers {
     pub fn open_model_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.open_kind() != Some(PickerKind::HarnessModel) {
             self.toggle(PickerKind::HarnessModel, window, cx);
+        }
+    }
+
+    /// Open the shared harness/model picker to choose the summarizer for
+    /// `chat_id`. The pick surfaces as [`CompactModelPicked`] and never
+    /// touches the chat's active model.
+    pub fn open_for_compact(
+        &mut self,
+        chat_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.compact_chat = Some(chat_id);
+        if self.open_kind() != Some(PickerKind::HarnessModel) {
+            self.toggle(PickerKind::HarnessModel, window, cx);
+        } else {
+            cx.notify();
         }
     }
 
@@ -1781,6 +1814,14 @@ impl Pickers {
 
     fn pick_model(&mut self, model_id: String, cx: &mut Context<Self>) {
         self.setting_menu = None;
+        if let Some(chat_id) = self.compact_chat.take() {
+            cx.emit(CompactModelPicked {
+                chat_id,
+                model_id,
+            });
+            self.close(cx);
+            return;
+        }
         if self.title.is_some() {
             let settings = TitleSettings {
                 harness: self.effective_harness(cx),
@@ -6871,6 +6912,55 @@ mod tests {
             2,
             "closing via the trigger returns to the composer"
         );
+    }
+
+    #[gpui::test]
+    fn compact_pick_emits_without_touching_the_chat_model(cx: &mut gpui::TestAppContext) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let handle = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Pickers::new(state, cx)
+        });
+        let picked: Rc<RefCell<Vec<CompactModelPicked>>> = Rc::new(RefCell::new(Vec::new()));
+        let observed = picked.clone();
+        let _sub = cx.update(|cx| {
+            cx.subscribe(
+                &handle.entity(cx).unwrap(),
+                move |_, event: &CompactModelPicked, _| observed.borrow_mut().push(event.clone()),
+            )
+        });
+        handle
+            .update(cx, |pickers, window, cx| {
+                pickers.open_for_compact("chat-1".into(), window, cx);
+                assert!(pickers.is_open(), "compact opens the shared model picker");
+                pickers.pick_model("opencode/muse".into(), cx);
+            })
+            .unwrap();
+        assert_eq!(picked.borrow().len(), 1);
+        assert_eq!(picked.borrow()[0].chat_id, "chat-1");
+        assert_eq!(picked.borrow()[0].model_id, "opencode/muse");
+        handle
+            .update(cx, |pickers, _, _| {
+                assert!(!pickers.is_open(), "a compact pick closes the picker");
+                assert!(
+                    pickers.config.model.is_none(),
+                    "compact must not rewrite the draft/chat model"
+                );
+            })
+            .unwrap();
+        handle
+            .update(cx, |pickers, window, cx| {
+                // Arming then dismissing clears the target: the next normal
+                // pick must not emit a compact event.
+                pickers.open_for_compact("chat-2".into(), window, cx);
+                pickers.dismiss(cx);
+                pickers.open_model_menu(window, cx);
+                pickers.pick_model("opencode/other".into(), cx);
+            })
+            .unwrap();
+        assert_eq!(picked.borrow().len(), 1, "dismissed compact arms nothing");
     }
 
     #[gpui::test]

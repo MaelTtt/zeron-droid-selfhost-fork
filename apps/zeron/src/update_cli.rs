@@ -7,10 +7,24 @@ use anyhow::bail;
 use zeron_update::{InstallKind, current_version, is_fork_version, version_newer};
 
 /// `--check` prints the verdict and exits (nonzero when an update is available,
-/// so scripts can gate on it).
+/// so scripts can gate on it). Fork installs resolve the newest `-mael.N`
+/// release (edge feed or GitHub) instead of the stock feed.
 pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
     let fork = std::env::var("ZERON_FORK").is_ok_and(|v| !v.trim().is_empty());
-    let manifest = zeron_update::fetch_latest(edge_url).await?;
+    // Fork installs resolve `-mael.N` releases (GitHub or edge feed);
+    // stock keeps the edge feed. The download base rides along so a GitHub
+    // release stages from its own assets.
+    let (manifest, download_base) = if fork {
+        match zeron_update::fetch_fork_update(edge_url).await? {
+            Some(resolved) => (resolved.manifest, Some(resolved.download_base)),
+            None => {
+                println!("zeron {} is up to date.", current_version());
+                return Ok(());
+            }
+        }
+    } else {
+        (zeron_update::fetch_latest(edge_url).await?, None)
+    };
     let current = current_version();
     if !version_newer(&manifest.version, current) {
         println!(
@@ -50,7 +64,12 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
                 "downloading {}…",
                 zeron_update::headless_artifact(&manifest.version)
             );
-            zeron_update::stage_headless(edge_url, &manifest, &app_root).await?;
+            match download_base {
+                Some(base) => {
+                    zeron_update::stage_headless_from_base(&base, &manifest, &app_root).await?
+                }
+                None => zeron_update::stage_headless(edge_url, &manifest, &app_root).await?,
+            };
             zeron_update::apply_headless(&app_root, &manifest.version)?;
             println!(
                 "installed {} (current → {})",
@@ -89,6 +108,13 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
             Ok(())
         }
         InstallKind::Unmanaged => {
+            if fork {
+                bail!(
+                    "this fork build is not update-managed (source build or hand-copied).\n\
+                     Download the new release tarball from {} and run its install.sh, or rebuild from source.",
+                    zeron_update::fork_releases_page()
+                )
+            }
             bail!(
                 "this binary is not update-managed (source build or hand-copied).\n\
                  Linux: curl -fsSL https://zeron.sh/install.sh | sh, or run install.sh from the release tarball\n\

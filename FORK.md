@@ -11,9 +11,9 @@ releases.
 | 9c1673d6 | **Factory Droid as a first-class ACP harness** — `droid exec --output-format acp`, live model discovery, autonomy wiring | upstream PR #372 (rebased) |
 | 30df737d | Droid permission level persistence in the model picker | upstream PR #372 |
 | 8014e64d | **Self-host the edge with `AUTH_MODE=none`** — Docker edge relay (`docker-compose.selfhost.yml`, `edge/Dockerfile`, `edge/wrangler.selfhost.jsonc`, `docs/SELFHOST.md`); the engine accepts your own `ZERON_EDGE_URL` with no WorkOS/Zeron account | upstream PR #317 |
-| ba470911 | **Fork identity** — version `0.2.102-mael.4` (upstream base v0.2.102); `zeron update` refuses to overwrite the fork with *stock* while `ZERON_FORK` is set (points at `zeron-fork-update`), but one-click applies `-mael.N` releases from the fork feed (fork-aware staging into `fork-<version>/`); background auto-update disabled; `zeron status` shows the fork line | mael |
+| ba470911 | **Fork identity** — version `0.2.102-mael.5` (upstream base v0.2.102); `zeron update` refuses to overwrite the fork with *stock* while `ZERON_FORK` is set (points at `zeron-fork-update`), but one-click applies `-mael.N` releases from the fork feed (fork-aware staging into `fork-<version>/`); background auto-update disabled; `zeron status` shows the fork line | mael |
 | — | **Rewind** — rewind button in the hover strip under each sent message (click twice to confirm) plus double-Escape prompt list. For Droid and OpenCode chats it truncates the transcript from that message and drops the agent's session (`RewindChat` RPC); the next run starts a fresh session bootstrapped with the remaining transcript. Files are not reverted. Other harnesses only get the prompt text back | upstream PR #384 + mael |
-| — | **Compact + open-in-CLI titlebar buttons** (OpenCode/Droid chats only) — compact opens a searchable provider-grouped model picker then `CompactChat`: OpenCode compacts through its own API (picked model applied to the session first, since compaction uses the session's model), Droid queues a `/compress` turn. Also reachable from the context-window popup. The terminal button shows the native resume command (`opencode --session <id>` / `droid --resume <id>`) with copy + one-click run in a fresh embedded terminal tab | mael |
+| — | **Compact + open-in-terminal titlebar buttons** (OpenCode/Droid chats only) — compact opens the chat input's own model picker to choose the summarizer, then `CompactChat` (the pick never rewrites the chat's active model; failures surface on the composer): OpenCode compacts through its own API (picked model applied to the session first, since compaction uses the session's model), Droid queues a `/compress` turn. Also reachable from the context-window popup. The terminal button runs the native resume command (`opencode --session <id>` / `droid --resume <id>`) in a fresh embedded terminal tab in one click | mael |
 | 0502fe67 | 0.2.86 surface adaptation of the droid harness (install methods, skills dirs, spec fields, registry descriptor, auth test API) | mael |
 | 1f691a9c | **One-click update strip + droid fallback chip** — managed installs apply headless releases from the sidebar strip (`ApplyUpdate`: stage + swap + service restart, with updating/failed states); a fork build applies `-mael.N` releases from the fork feed the same way (fork-aware staging) and opens a fresh session with the rebase runbook prefilled for *stock* releases (which would clobber the fork); ACP `config_option_update` model changes surface as an amber "Model switched" transcript chip (Droid's quota fallback onto its core models) | mael |
 
@@ -23,8 +23,8 @@ When upstream #372 merges, the rebase will naturally drop what upstream already 
 
 ## Versioning
 
-- Fork version = `<upstream version>-mael.<n>` (currently `0.2.102-mael.4`), tag
-  `mael/v<version>` on `main`.
+- Fork version = `<upstream version>-mael.<n>` (currently `0.2.102-mael.5`), tag
+  `v<version>` on `main` (no slash — slashes break release downloads).
 - `version_newer` compares numeric cores first; on equal cores a higher
   `-mael.N` counts as newer **only when the installed build is itself a
   `-mael.*`** — so `mael.2` > `mael.1` is discovered, while a fork at the
@@ -35,36 +35,69 @@ When upstream #372 merges, the rebase will naturally drop what upstream already 
 
 ## Cutting a one-click fork release
 
-`zeron-fork-update` (rebase + rebuild on each machine) still works, but fork
-releases can now also be applied one-click from the sidebar strip or
-`zeron update` — provided they are published to the feed the engines poll
-(`{edge}/releases/`, i.e. the `zeron-selfhost-releases` bucket on the
-homelab edge):
+Push a `v<version>-mael.N` tag and every other device on the fork gets the
+sidebar "Update available" button (or `zeron update`) straight from the
+fork's GitHub releases — no edge publish step. CI
+(`.github/workflows/fork-release.yml`) builds the Linux tarballs and
+attaches them + `manifest.json` to the release:
 
 ```bash
 # 1. Bump [workspace.package] version in Cargo.toml:
 #    numeric core and/or -mael.N must grow (mael.3 > mael.2 counts, but
 #    0.2.102-mael.2 does NOT supersede 0.2.102 — see version_newer above).
-# 2. Commit, tag mael/v<version>, push main.
-# 3. Build + stage the release metadata:
-scripts/publish-fork-release.sh            # or --skip-build to reuse tarballs
-# 4. Upload (artifacts, then manifest.json, then latest.txt — order matters):
-scripts/publish-fork-release.sh --upload
+# 2. Commit, tag, push (tag has NO slash — slashes break release downloads):
+git tag v0.2.102-mael.4 && git push origin main v0.2.102-mael.4
+# 3. CI builds x86_64 + aarch64 and publishes the GitHub release.
 ```
 
-Multi-arch: run step 3 once per arch (or gather the tarballs into
-`target/package/`) — the manifest merges every `zeron-<VERSION>-*.tar.gz`
-found. Remote R2 needs `CLOUDFLARE_API_TOKEN`; against the homelab's local
-persist dir set `EDGE_PERSIST_DIR=/data` (run from the edge host).
+What the client does on click (`ApplyUpdate` RPC): discovers the newest
+`-mael.N` release newer than the installed version via the GitHub releases
+API (the homelab edge `{edge}/releases/` feed is still checked too, newest
+wins), downloads the tarball, verifies sha256 against the release's
+`manifest.json`, unpacks into `~/.zeron/app/fork-<ver>/` with the
+`.mael-fork` marker, atomically repoints `current`, prunes older fork dirs
+(keeps the newest spare), and restarts `zeron.service`. Stock releases are
+never offered, so the fork can't be clobbered; unmanaged source builds link
+to the fork's releases page instead (`ZERON_FORK_REPO` overrides the repo
+when renamed).
 
-What the client does on click (`ApplyUpdate` RPC): downloads the tarball,
-verifies sha256 against the manifest, unpacks into `~/.zeron/app/fork-<ver>/`
-with the `.mael-fork` marker, atomically repoints `current`, prunes older
-fork dirs (keeps the newest spare), and restarts `zeron.service`. A fork
-install offered a *stock* version opens a fresh session with the rebase
-runbook prefilled in the composer (not sent) — the user's own agent does
-the rebase + rebuild + install per the runbook below. The `-mael.N` suffix
-is the proof of fork origin, and stock never publishes one.
+Legacy path (LAN-only, no GitHub): `scripts/publish-fork-release.sh`
+builds + stages the same metadata locally, and `--upload` pushes it to the
+homelab edge bucket (`zeron-selfhost-releases`) the engines poll as a
+fallback at `{edge}/releases/`. Multi-arch: run step 3 once per arch (or
+gather the tarballs into `target/package/`) — the manifest merges every
+`zeron-<VERSION>-*.tar.gz` found. Remote R2 needs `CLOUDFLARE_API_TOKEN`;
+against the homelab's local persist dir set `EDGE_PERSIST_DIR=/data` (run
+from the edge host). Upload order still matters: artifacts, then
+manifest.json, then latest.txt.
+
+## Runbook for future AI agents: shipping fork changes
+
+When the user asks for fork changes AND wants them live on all devices,
+always finish with a release — code on `main` alone never reaches the
+other machines. Follow this checklist every time:
+
+1. Implement + verify: `cargo check` / `cargo test -p <crate>` for what
+   changed. Local builds need mold at `~/.local/bin/mold` PLUS a
+   `~/.local/bin/ld.mold` symlink to it (`.cargo/config.toml` passes
+   `-fuse-ld=mold`, and gcc looks for `ld.mold` — without the symlink
+   linking fails with a confusing `cannot find 'ld'`). Run tests with
+   `env -u ZERON_FORK`: the ambient `ZERON_FORK=mael` on the home PC
+   breaks stock-assuming update tests.
+2. Bump `[workspace.package] version` in `Cargo.toml` (`-mael.N` + 1, or
+   the new upstream core + `-mael.1`) and update the two version refs in
+   this file (identity row + Versioning section). Run `cargo check` once
+   so `Cargo.lock` follows the bump, and commit the lock too.
+3. Commit on `main`, then tag **slashless**: `git tag v<version>`
+   (e.g. `v0.2.102-mael.5`). NEVER `mael/v<version>` — slashes break
+   GitHub release-download URLs. `release.yml` ignores `v*-mael.*`
+   tags, so only `fork-release.yml` fires.
+4. `git push origin main v<version>` — CI builds x86_64 + aarch64 and
+   publishes the GitHub release. Watch the `fork-release` run; every
+   other device then shows the sidebar "Update available" button
+   (or `zeron update`).
+5. Update THIS pc from the new release (sidebar button or `zeron update`),
+   or rebuild + reinstall locally via `scripts/install-desktop.sh`.
 
 ## Taking an official release (low-friction path)
 
@@ -77,8 +110,10 @@ zeron-fork-update
 
 The script (`~/.local/bin/zeron-fork-update`) fetches upstream, rebases the fork commits onto
 the new `origin/main`, rebuilds in release mode, swaps the binary into
-`~/.zeron/app/local-mael`, bumps the `mael/v*` tag, repoints `~/.zeron/app/current`, and
-restarts the `zeron.service` engine.
+`~/.zeron/app/local-mael`, repoints `~/.zeron/app/current`, and
+restarts the `zeron.service` engine. Then cut a one-click release per
+above (bump `-mael.N`, tag `v<version>`, push) so the other devices update
+from the sidebar.
 
 If the rebase conflicts, it aborts safely. Resolve markers, then:
 

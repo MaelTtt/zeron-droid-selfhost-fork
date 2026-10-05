@@ -15,7 +15,10 @@ name: release
 
 on:
   push:
-    tags: ["v*"]
+    # Fork exclusion: `-mael.N` tags are built by fork-release.yml instead
+    # (Linux headless tarballs only). Without this, a fork tag would also
+    # run the full stock pipeline and publish a stock release over it.
+    tags: ["v*", "!v*-mael.*"]
   workflow_dispatch:
 
 permissions:
