@@ -218,16 +218,32 @@ impl AppUpdate {
         };
         let stage = Tokio::spawn(cx, async move {
             // Re-read the manifest so a long-lived status still downloads the
-            // newest release, with that release's checksums.
-            let manifest = zeron_update::fetch_latest(&edge_url).await?;
-            anyhow::ensure!(
-                zeron_update::version_newer(&manifest.version, zeron_update::current_version()),
-                "the release feed no longer offers a newer version"
-            );
-            let staged = install
-                .stage_desktop(&edge_url, &manifest, &data_dir)
-                .await?;
-            anyhow::Ok((manifest.version, staged))
+            // newest release, with that release's checksums. Fork installs
+            // resolve the `-mael.N` release (GitHub or edge feed) and stage
+            // from its own download base — never stock, which would clobber
+            // the fork.
+            if zeron_update::is_fork_install() {
+                let Some(resolved) = zeron_update::fetch_fork_update(&edge_url).await? else {
+                    anyhow::bail!("the fork feed no longer offers a newer version");
+                };
+                let staged = install
+                    .stage_fork_desktop(&resolved.manifest, &resolved.download_base)
+                    .await?;
+                anyhow::Ok((resolved.manifest.version, staged))
+            } else {
+                let manifest = zeron_update::fetch_latest(&edge_url).await?;
+                anyhow::ensure!(
+                    zeron_update::version_newer(
+                        &manifest.version,
+                        zeron_update::current_version()
+                    ),
+                    "the release feed no longer offers a newer version"
+                );
+                let staged = install
+                    .stage_desktop(&edge_url, &manifest, &data_dir)
+                    .await?;
+                anyhow::Ok((manifest.version, staged))
+            }
         });
         self.download = Some(cx.spawn(async move |this, cx| {
             let outcome = match stage.await {
