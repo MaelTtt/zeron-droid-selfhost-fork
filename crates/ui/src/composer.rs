@@ -5398,6 +5398,9 @@ impl Render for ComposerInput {
 /// Events the shell listens for.
 #[derive(Debug, Clone)]
 pub enum ComposerEvent {
+    /// The compact model picker resolved: run `CompactChat` with it without
+    /// touching the chat's active model.
+    CompactModelPicked { chat_id: String, model_id: String },
     WorkspaceCommand(WorkspaceCommand),
     /// Arm the shared-element transition before the draft route is replaced
     /// by the newly-created session. Emitting this before `select_chat` keeps
@@ -6181,6 +6184,7 @@ pub struct Composer {
     /// A side chat's composer: its footer keeps only the context ring.
     side_chat: bool,
     _picker_focus: Subscription,
+    _compact_pick: Subscription,
     _input_events: Subscription,
     _dictation_events: Subscription,
     dictation_activation: Option<Subscription>,
@@ -6276,6 +6280,15 @@ impl Composer {
             |this: &mut Self, _, _: &crate::pickers::ReturnComposerFocus, cx| {
                 this.focus_pending = true;
                 cx.notify();
+            },
+        );
+        let compact_pick = cx.subscribe(
+            &pickers,
+            |_: &mut Self, _, event: &crate::pickers::CompactModelPicked, cx| {
+                cx.emit(ComposerEvent::CompactModelPicked {
+                    chat_id: event.chat_id.clone(),
+                    model_id: event.model_id.clone(),
+                });
             },
         );
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
@@ -6436,6 +6449,7 @@ impl Composer {
             account_usage,
             side_chat: false,
             _picker_focus: picker_focus,
+            _compact_pick: compact_pick,
             _input_events: input_events,
             _dictation_events: dictation_events,
             dictation_activation: None,
@@ -6482,6 +6496,19 @@ impl Composer {
     pub fn open_model_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.pickers
             .update(cx, |pickers, cx| pickers.open_model_menu(window, cx));
+    }
+
+    /// Open the shared harness/model picker to choose a compact summarizer
+    /// for `chat_id`. The pick never rewrites the chat's active model.
+    pub fn open_compact_picker(
+        &mut self,
+        chat_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pickers.update(cx, |pickers, cx| {
+            pickers.open_for_compact(chat_id, window, cx)
+        });
     }
 
     pub fn is_sending(&self) -> bool {
