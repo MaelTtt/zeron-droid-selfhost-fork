@@ -16,16 +16,20 @@ name: fork-release
 # release.yml explicitly ignores `v*-mael.*` tags so the stock pipeline
 # never fires on a fork tag.
 #
-# Trigger: push a tag `v<version>-mael.N` matching the workspace version
-# (bump `[workspace.package] version` in the same commit, e.g.
-# `0.2.102-mael.4` → tag `v0.2.102-mael.4`), or run manually via
-# workflow_dispatch (builds artifacts, no GitHub release).
+# Triggers:
+#   - push to main whose `[workspace.package] version` is a `-mael.N` with no
+#     `v<version>` tag yet: builds, then tags + publishes that commit. So
+#     "bump the version and push main" is a release.
+#   - push of a tag `v<version>-mael.N` matching the workspace version.
+#     Pushing main and the tag together publishes once (the main run sees
+#     the tag and leaves it to the tag run).
+#   - workflow_dispatch: builds artifacts, no GitHub release.
 #
 # Flow per device after cutting a release:
-#   1. home PC: bump version, commit, `git tag v<ver> && git push origin main v<ver>`
+#   1. home PC: bump version, commit, `git push origin main` (optionally with the tag)
 #   2. CI builds + attaches `zeron-<ver>-linux-*.tar.gz` + `manifest.json`
-#   3. other devices: sidebar strip "Update available — v<ver> · click to update"
-#      (or `zeron update`) stages into `~/.zeron/app/fork-<ver>/` and restarts.
+#   3. other devices: account menu "Update Zeron fork" (or the sidebar strip,
+#      or `zeron update`) stages into `~/.zeron/app/fork-<ver>/` and restarts.
 #
 # Stock official releases never trigger the fork button: fork installs ignore
 # non `-mael.N` versions entirely. To adopt an official release with fork
@@ -34,6 +38,7 @@ name: fork-release
 
 on:
   push:
+    branches: [main]
     tags: ["v*-mael.*"]
   workflow_dispatch:
 
@@ -41,7 +46,43 @@ permissions:
   contents: write
 
 jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      build: ${{ steps.plan.outputs.build }}
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - id: plan
+        run: |
+          ver="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          build=false publish=false
+          case "$GITHUB_EVENT_NAME:$GITHUB_REF_TYPE" in
+            workflow_dispatch:*) build=true ;;
+            push:tag)
+              [ "${GITHUB_REF_NAME#v}" = "$ver" ] \
+                || { echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $ver"; exit 1; }
+              build=true publish=true ;;
+            push:branch)
+              case "$ver" in
+                *-mael.*)
+                  if git ls-remote --exit-code --tags origin "refs/tags/v$ver" >/dev/null; then
+                    echo "v$ver is already tagged; nothing to release"
+                  else
+                    build=true publish=true
+                  fi ;;
+                *) echo "$ver is not a fork version; nothing to release" ;;
+              esac ;;
+          esac
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "version=$ver build=$build publish=$publish"
+
   linux:
+    needs: [resolve]
+    if: needs.resolve.outputs.build == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -62,12 +103,16 @@ jobs:
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - name: mold linker (required by .cargo/config.toml)
+        # `-fuse-ld=mold` (x86_64 only) makes gcc look up `ld.mold` on PATH;
+        # a bare `mold` binary alone fails the link with exit 101.
         run: |
           mkdir -p ~/.local/bin
           arch="$(uname -m)"
-          ver="$(curl -fsSL https://api.github.com/repos/rui314/mold/releases/latest | jq -r .tag_name | sed 's/^v//')"
+          ver="$(curl -fsSL -H "Authorization: Bearer ${{ github.token }}" https://api.github.com/repos/rui314/mold/releases/latest | jq -r .tag_name | sed 's/^v//')"
           curl -fsSL "https://github.com/rui314/mold/releases/download/v${ver}/mold-${ver}-${arch}-linux.tar.gz" | tar xz
           cp "mold-${ver}-${arch}-linux/bin/mold" ~/.local/bin/mold
+          ln -sf mold ~/.local/bin/ld.mold
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           ~/.local/bin/mold --version
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: package
@@ -79,24 +124,26 @@ jobs:
           if-no-files-found: error
 
   publish:
-    # Tag pushes only (the trigger already limits tags to `v*-mael.*`);
-    # workflow_dispatch builds artifacts without publishing a release.
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [linux]
+    # Fork tag pushes, and main pushes carrying an untagged `-mael.N` version
+    # (see `resolve`); workflow_dispatch builds artifacts without a release.
+    if: needs.resolve.outputs.publish == 'true'
+    needs: [resolve, linux]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
-      - name: version guard (tag == Cargo.toml version)
+      - name: version guard (artifacts == Cargo.toml version)
+        env:
+          VER: ${{ needs.resolve.outputs.version }}
         run: |
-          ver="${GITHUB_REF_NAME#v}"
-          echo "tag version: $ver"
+          ver="$VER"
+          echo "release version: $ver"
           ls dist/
           case "$ver" in
             *-mael.*) ;;
-            *) echo "tag $GITHUB_REF_NAME is not a fork tag (want v<version>-mael.N)"; exit 1;;
+            *) echo "$ver is not a fork version (want <version>-mael.N)"; exit 1;;
           esac
           for f in dist/zeron-"$ver"-linux-*.tar.gz; do
             test -f "$f" || { echo "missing artifact for tag v$ver (want zeron-$ver-linux-<arch>.tar.gz)"; exit 1; }
@@ -114,6 +161,9 @@ jobs:
           cat manifest.json
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
+          # Main-push releases create the tag on the built commit.
+          tag_name: v${{ needs.resolve.outputs.version }}
+          target_commitish: ${{ github.sha }}
           files: |
             dist/*
             manifest.json

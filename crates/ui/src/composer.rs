@@ -5357,7 +5357,10 @@ impl Render for ComposerInput {
 pub enum ComposerEvent {
     /// The compact model picker resolved: run `CompactChat` with it without
     /// touching the chat's active model.
-    CompactModelPicked { chat_id: String, model_id: String },
+    CompactModelPicked {
+        chat_id: String,
+        model_id: String,
+    },
     WorkspaceCommand(WorkspaceCommand),
     /// Arm the shared-element transition before the draft route is replaced
     /// by the newly-created session. Emitting this before `select_chat` keeps
@@ -6040,6 +6043,9 @@ pub struct Composer {
     /// under their own chat — a blanket clear-on-switch erased the one
     /// visible trace of a failed send (2026-08-19).
     failure_key: Option<String>,
+    /// A quiet caption for a background action on one chat (e.g.
+    /// compaction), with the chat key it belongs to.
+    activity: Option<(SharedString, String)>,
     wizard: Option<Wizard>,
     wizard_focus: FocusHandle,
     /// Requests already answered locally (suppresses the panel until the doc
@@ -6354,6 +6360,7 @@ impl Composer {
             wizard_focus: cx.focus_handle(),
             answered_requests: HashSet::new(),
             failure_key: None,
+            activity: None,
             action_task: None,
             advance_task: None,
             send_task: None,
@@ -6650,6 +6657,36 @@ impl Composer {
         self.failure = Some(message.into());
         self.failure_key = Some(self.current_key.clone());
         cx.notify();
+    }
+
+    /// Show `message` as the current chat's activity caption; returns the
+    /// chat key to clear it with.
+    pub(crate) fn show_activity(
+        &mut self,
+        message: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> String {
+        let key = self.current_key.clone();
+        self.show_activity_for(&key, message, cx);
+        key
+    }
+
+    pub(crate) fn show_activity_for(
+        &mut self,
+        key: &str,
+        message: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.activity = Some((message.into(), key.to_owned()));
+        cx.notify();
+    }
+
+    /// Clear the activity caption if it still belongs to `key`.
+    pub(crate) fn clear_activity(&mut self, key: &str, cx: &mut Context<Self>) {
+        if self.activity.as_ref().is_some_and(|(_, k)| k == key) {
+            self.activity = None;
+            cx.notify();
+        }
     }
 
     /// Run `stage` on the background executor — reading a file and converting
@@ -10862,6 +10899,11 @@ impl Render for Composer {
         let expanded = self.expanded_mode;
 
         let failure = self.visible_failure();
+        let activity = self
+            .activity
+            .as_ref()
+            .filter(|(_, key)| *key == self.current_key)
+            .map(|(message, _)| message.clone());
         // Composer honesty: when the target's delivery path is degraded, say
         // UP FRONT that a send will queue (a durable local write delivered on
         // reconnect) instead of letting the button imply instant delivery.
@@ -10951,6 +10993,23 @@ impl Render for Composer {
                         .text_color(theme.text_faint)
                         .child(div().size(px(5.0)).rounded_full().bg(dot))
                         .child(div().min_w_0().truncate().child(notice)),
+                ))
+            })
+            .when_some(activity, |el, message| {
+                el.child(crate::motion::fade_in(
+                    "composer-activity",
+                    div()
+                        .id("composer-activity")
+                        .mx(px(8.0))
+                        .mt(px(6.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .text_size(px(11.0))
+                        .line_height(px(14.0))
+                        .text_color(theme.text_faint)
+                        .child(div().size(px(5.0)).rounded_full().bg(theme.accent))
+                        .child(div().min_w_0().truncate().child(message)),
                 ))
             });
 
