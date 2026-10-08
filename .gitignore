@@ -10,6 +10,8 @@ node_modules
 .wrangler
 build/
 edge/dist/
+# Local self-host edge state (`wrangler dev --persist-to ./data`).
+edge/data/
 .agents
 .claude
 CLAUDE.md

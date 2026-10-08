@@ -66,6 +66,9 @@ pub enum StripAction {
 pub struct AppUpdate {
     install: InstallKind,
     blocker: Option<UpdateBlocker>,
+    /// mael-fork build: the checker resolves the fork's own releases, and
+    /// the update surfaces name the fork and link its releases page.
+    fork: bool,
     /// Background download + install on quit (`ZERON_AUTO_UPDATE` unset or on).
     automatic: bool,
     edge_url: String,
@@ -125,6 +128,7 @@ impl AppUpdate {
         Self {
             install,
             blocker,
+            fork: zeron_update::is_fork_install(),
             automatic: zeron_update::desktop_auto_update_enabled(),
             edge_url,
             data_dir,
@@ -153,6 +157,25 @@ impl AppUpdate {
 
     pub fn prompt(&self) -> Option<&Prompt> {
         self.prompt.as_ref()
+    }
+
+    pub fn is_fork(&self) -> bool {
+        self.fork
+    }
+
+    /// Whether a staged update the user never restarts for installs on quit.
+    pub fn installs_on_quit(&self) -> bool {
+        self.automatic
+    }
+
+    /// Where "download from GitHub" sends this build: the fork's own releases
+    /// on fork builds (a stock download would replace the fork).
+    pub fn releases_page(&self) -> String {
+        if self.fork {
+            zeron_update::fork_releases_page()
+        } else {
+            zeron_update::RELEASES_PAGE.to_owned()
+        }
     }
 
     /// The newer release the last check found, if any.
@@ -233,10 +256,7 @@ impl AppUpdate {
             } else {
                 let manifest = zeron_update::fetch_latest(&edge_url).await?;
                 anyhow::ensure!(
-                    zeron_update::version_newer(
-                        &manifest.version,
-                        zeron_update::current_version()
-                    ),
+                    zeron_update::version_newer(&manifest.version, zeron_update::current_version()),
                     "the release feed no longer offers a newer version"
                 );
                 let staged = install
@@ -293,7 +313,9 @@ impl AppUpdate {
                 let outcome = match result {
                     Ok(status) => {
                         this.status = Some(status);
-                        if this.automatic {
+                        // A fork build never downloads in the background, so
+                        // the explicit "Update Zeron fork" click is the go-ahead.
+                        if this.automatic || this.fork {
                             this.download_if_needed(cx);
                         }
                         Prompt::Result

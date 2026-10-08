@@ -2442,10 +2442,7 @@ impl Pickers {
     fn pick_model(&mut self, model_id: String, cx: &mut Context<Self>) {
         self.setting_menu = None;
         if let Some(chat_id) = self.compact_chat.take() {
-            cx.emit(CompactModelPicked {
-                chat_id,
-                model_id,
-            });
+            cx.emit(CompactModelPicked { chat_id, model_id });
             self.close(cx);
             return;
         }
