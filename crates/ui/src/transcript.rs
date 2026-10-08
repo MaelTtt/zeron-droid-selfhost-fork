@@ -3284,6 +3284,9 @@ pub struct Transcript {
     /// history, so it takes a second click while armed.
     rewind_armed: Option<SharedString>,
     rewind_armed_clear: Option<Task<()>>,
+    /// Only the main chat transcript rewinds: side-chat forks keep their
+    /// source's entry ids, so a rewind there would truncate the parent chat.
+    rewindable: bool,
     /// Transcript attachment being viewed full-size (click a user thumbnail).
     attachment_preview: Option<crate::attachments::PreviewImage>,
     /// Focused while the lightbox is open so Escape reaches it.
@@ -3588,6 +3591,7 @@ impl Transcript {
             copied_message_clear: None,
             rewind_armed: None,
             rewind_armed_clear: None,
+            rewindable: false,
             attachment_preview: None,
             attachment_preview_focus: cx.focus_handle(),
             attachment_preview_return_focus: None,
@@ -6960,7 +6964,7 @@ impl Transcript {
                         .text_color(theme.text_muted),
                     )
             });
-            let rewind = is_user_row.then(|| {
+            let rewind = (is_user_row && self.rewindable).then(|| {
                 let entry_id = copy_entry_id.clone();
                 let fade_key = format!("rewind-message-hover-{entry_id}");
                 div()
@@ -6980,18 +6984,19 @@ impl Transcript {
                     .on_click(
                         cx.listener(move |this, _, _, cx| this.click_rewind(entry_id.clone(), cx)),
                     )
+                    .tooltip(crate::settings::widgets::text_tooltip(if rewind_armed {
+                        "Click again to rewind — removes this and later messages"
+                    } else {
+                        "Rewind to here"
+                    }))
                     .child(
-                        crate::icons::icon(if rewind_armed {
-                            crate::icons::CHECK
-                        } else {
-                            crate::icons::RESTART
-                        })
-                        .size(px(14.0))
-                        .text_color(if rewind_armed {
-                            theme.danger
-                        } else {
-                            theme.text_muted
-                        }),
+                        crate::icons::icon(crate::icons::RESTART)
+                            .size(px(14.0))
+                            .text_color(if rewind_armed {
+                                theme.danger
+                            } else {
+                                theme.text_muted
+                            }),
                     )
             });
             let metadata = div()
@@ -7138,6 +7143,11 @@ impl Transcript {
                 .inset_0(),
             )
             .into_any_element()
+    }
+
+    /// Show the rewind action on sent messages (the main chat transcript).
+    pub fn set_rewindable(&mut self, rewindable: bool) {
+        self.rewindable = rewindable;
     }
 
     fn click_rewind(&mut self, entry_id: SharedString, cx: &mut Context<Self>) {

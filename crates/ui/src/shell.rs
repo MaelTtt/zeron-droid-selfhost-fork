@@ -135,12 +135,14 @@ struct RewindState {
     selected: usize,
 }
 
-/// Native command resuming `session_id` in the agent's own terminal.
+/// `(tab title, command)` resuming `session_id` in the agent's own CLI.
 /// `None` for harnesses without a CLI resume story.
-fn cli_resume_command(harness: HarnessId, session_id: &str) -> Option<String> {
+fn cli_resume_command(harness: HarnessId, session_id: &str) -> Option<(&'static str, String)> {
+    // POSIX single-quoting: the id comes from the agent, not from us.
+    let id = format!("'{}'", session_id.replace('\'', r"'\''"));
     match harness {
-        HarnessId::Opencode => Some(format!("opencode --session {session_id}")),
-        HarnessId::Droid => Some(format!("droid --resume {session_id}")),
+        HarnessId::Opencode => Some(("OpenCode", format!("opencode --session {id}"))),
+        HarnessId::Droid => Some(("Droid", format!("droid --resume {id}"))),
         _ => None,
     }
 }
@@ -1456,18 +1458,6 @@ struct ChatRename {
     _blur: Option<Subscription>,
 }
 
-/// In-app update lifecycle (macOS bundle installs; see `render_update_strip`).
-enum UpdateFlow {
-    Idle,
-    Downloading,
-    /// Staged bundle ready to swap in — one click restarts into it.
-    Ready(PathBuf),
-    /// Managed (headless) apply in flight — the `ApplyUpdate` RPC stages,
-    /// swaps, and restarts the engine service; the strip waits on it.
-    Applying,
-    Failed(SharedString),
-}
-
 /// Account lifecycle owned by this process. Sign-in on a local workspace
 /// flows through the in-place switch wizard (offer → switch → import → done);
 /// `RestartPending` survives only as the fallback when the in-place swap
@@ -1759,6 +1749,41 @@ fn sidebar_account_identity(
             None => ("Local".into(), "Not signed in".into()),
         },
     }
+}
+
+/// The "Rebase onto upstream…" brief: everything an agent needs to move the
+/// fork onto the newest official release and ship it as a fork release,
+/// without the user re-explaining the fork layout. `clone` is the fork
+/// checkout the session is homed on, when this device has one open.
+fn fork_rebase_prompt(current: &str, clone: Option<&str>, fork_repo: &str) -> String {
+    let clone_line = match clone {
+        Some(path) => format!("`{path}` (this session's project), branch `main`."),
+        None => format!(
+            "no project for it is open on this device. Use `~/.build/zeron`; if that folder \
+             is missing, clone https://github.com/{fork_repo}.git there."
+        ),
+    };
+    format!(
+        "Rebase my Zeron fork onto the latest official Zeron release, then ship it as a new fork release so my other devices can update.\n\
+        \n\
+        Context:\n\
+        - This app is my personal fork of Zeron, version {current}. FORK.md in the repo root lists the fork features and is the runbook: versioning rules, known conflict spots, and the shipping checklist. Read it first and follow it.\n\
+        - Fork clone: {clone_line}\n\
+        - Remotes: `origin` is my fork (https://github.com/{fork_repo}); `upstream` is official Zeron (https://github.com/zeronsh/zeron.git). Add `upstream` if it is missing.\n\
+        \n\
+        Steps:\n\
+        1. Preflight: the working tree must be clean on `main`. Run `git fetch origin` and make sure `main` matches `origin/main` (fast-forward if it is only behind). If it has diverged or has uncommitted changes, stop and tell me.\n\
+        2. Run `git fetch upstream --tags`. The target is the newest stable upstream tag `vX.Y.Z` (no suffix). If the fork already contains it (`git merge-base --is-ancestor vX.Y.Z HEAD`), tell me the fork is up to date and stop.\n\
+        3. Back up the current fork: `git branch backup/pre-rebase-v{current}` and `git push origin backup/pre-rebase-v{current}`.\n\
+        4. Rebase only the fork commits onto the target: `git rebase --onto vX.Y.Z $(git merge-base HEAD upstream/main)`.\n\
+        5. Resolve conflicts keeping both upstream's changes and the fork features. Where upstream now ships something a fork commit added, keep upstream's version and drop the fork's duplicate. Never commit conflict markers. If a conflict cannot be resolved safely, run `git rebase --abort` and report.\n\
+        6. Set `[workspace.package] version` in Cargo.toml to `X.Y.Z-mael.1` and update the version references in FORK.md.\n\
+        7. Verify: `cargo check --workspace` (this also refreshes Cargo.lock), then `env -u ZERON_FORK cargo test -p zeron-update` plus the tests of every crate you touched while resolving conflicts. Fix failures before going on.\n\
+        8. Commit the version bump, Cargo.lock, and FORK.md as `mael: rebase onto upstream vX.Y.Z`.\n\
+        9. Publish in one push (the history was rewritten, and the tag has no slash): `git tag vX.Y.Z-mael.1 && git push --force-with-lease origin main vX.Y.Z-mael.1`. That starts the fork-release workflow, which builds Linux x86_64 + aarch64 and publishes the GitHub release.\n\
+        10. Watch that workflow run until the release is published (`gh run watch` if available, otherwise poll https://api.github.com/repos/{fork_repo}/actions/runs). If it fails, fix the cause, commit, and push again.\n\
+        11. Report the upstream version adopted, the conflicts you resolved and how, the test results, and the release URL. Then remind me to click \"Update Zeron fork\" in the account menu on each device."
+    )
 }
 
 fn sync_flow_after_auth(
@@ -2060,20 +2085,6 @@ pub struct Shell {
     user_menu: popover::Popup<()>,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
-    /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
-    /// UpdateStatus stream says WHETHER one exists; this says how far the
-    /// download/stage of it has come in this process.
-    update_flow: UpdateFlow,
-    update_task: Option<Task<()>>,
-    /// Version whose update strip the user dismissed (advisory installs only —
-    /// a newer release shows the strip again).
-    update_dismissed: Option<String>,
-    /// How this binary was installed — decides the strip's click behavior.
-    /// Cached: `detect_install` stats `current_exe` and this renders per frame.
-    install: zeron_update::InstallKind,
-    /// mael-fork build (`.mael-fork` marker / `ZERON_FORK`) — the strip may
-    /// detect a newer release, but applying stock would clobber the fork.
-    fork: bool,
     org: Option<OrgGateUi>,
     sync_flow: SyncFlow,
     mutate_task: Option<Task<()>>,
@@ -2230,7 +2241,10 @@ impl Shell {
             ConnectionStatus::Ready | ConnectionStatus::Failed(_) => SplashPhase::Gone,
         };
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
-        transcript.update(cx, |transcript, _| transcript.retain_for_route_exit());
+        transcript.update(cx, |transcript, _| {
+            transcript.retain_for_route_exit();
+            transcript.set_rewindable(true);
+        });
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
         let links = Self::session_links(None, cx);
         transcript.update(cx, |transcript, _| {
@@ -2505,11 +2519,6 @@ impl Shell {
             harness_update_scroll: settings::widgets::PageScroll::default(),
             user_menu: popover::Popup::default(),
             sidebar_notice: None,
-            update_flow: UpdateFlow::Idle,
-            update_task: None,
-            update_dismissed: None,
-            install: zeron_update::detect_install(),
-            fork: zeron_update::is_fork_install(),
             org: None,
             sync_flow: SyncFlow::Idle,
             mutate_task: None,
@@ -4016,7 +4025,7 @@ impl Shell {
     /// transcripts (nested spawns open their own tabs).
     fn on_transcript_event(
         &mut self,
-        _: Entity<Transcript>,
+        source: Entity<Transcript>,
         event: &TranscriptEvent,
         cx: &mut Context<Self>,
     ) {
@@ -4035,6 +4044,9 @@ impl Shell {
                     cx,
                 );
             }
+            // Rewind acts on the selected chat, so only the main transcript
+            // may ask for it (forks share the parent's entry ids).
+            TranscriptEvent::RewindTo { .. } if source != self.transcript => {}
             TranscriptEvent::RewindTo { entry_id } => {
                 let Some(prompt) = self
                     .rewind_prompts(cx)
@@ -4213,7 +4225,8 @@ impl Shell {
     ) {
         let was_active = self.resolved_right_active(cx) == surface;
         let restore_focus = was_active && self.navigation_focus.in_right(window, cx);
-        self.navigation_focus.remember(&self.shortcut_focus, window, cx);
+        self.navigation_focus
+            .remember(&self.shortcut_focus, window, cx);
         let key = self.panel_key(cx);
         let files = match surface {
             RightSurface::File(id) => self.file_surfaces.get(&id).cloned(),
@@ -8047,13 +8060,19 @@ impl Shell {
         use zeron_proto::ConnectivityState as S;
         let conn = self.state.read(cx).connectivity.clone();
         let selected = self.state.read(cx).selected_chat.as_deref();
-        let chat = conn.chats.iter()
+        let chat = conn
+            .chats
+            .iter()
             .find(|c| Some(c.chat_id.as_str()) == selected);
         let chat_state = chat.map(|c| c.sync_state);
         let (label, glyph): (SharedString, AnyElement) = match conn.state {
             _ if chat_state == Some(zeron_proto::ChatSyncState::StorageError) => (
                 "Changes could not be saved".into(),
-                div().size(px(5.0)).rounded_full().bg(theme.warning).into_any_element(),
+                div()
+                    .size(px(5.0))
+                    .rounded_full()
+                    .bg(theme.warning)
+                    .into_any_element(),
             ),
             S::Disabled => return None,
             S::Connected => {
@@ -8061,9 +8080,13 @@ impl Shell {
                 (
                     caption.into(),
                     loaders::mini_mono_spinner(
-                        "chat-sync-spinner", 2.0, theme.text_muted,
-                        self.sidebar_pane.entity_id(), cx,
-                    ).into_any_element(),
+                        "chat-sync-spinner",
+                        2.0,
+                        theme.text_muted,
+                        self.sidebar_pane.entity_id(),
+                        cx,
+                    )
+                    .into_any_element(),
                 )
             }
             S::Offline => (
@@ -8315,7 +8338,6 @@ impl Shell {
 
         // t3code's archived accordion, below the active list.
         let archived_section = self.render_archived_section(theme, cx);
-
 
         // The space filter lives ABOVE the scroll region (fixed) so its
         // dropdown can float without being clipped by the list's overflow.
@@ -8621,13 +8643,12 @@ impl Shell {
     /// can't replace themselves explain why; advisory installs point at
     /// `zeron update` or the GitHub releases page and dismiss per version.
     fn render_update_strip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let latest = Self::latest_available(cx)?;
-        if self.update_dismissed.as_deref() == Some(latest.as_str()) {
-            return None;
-        }
-        let (label, clickable) =
-            Self::update_strip_label(&self.install, &self.update_flow, &latest, self.fork);
-        let failed = matches!(self.update_flow, UpdateFlow::Failed(_));
+        let update = crate::app_update::AppUpdate::global(cx)?;
+        let (label, action) = update.read(cx).strip()?;
+        let failed = matches!(
+            update.read(cx).flow(),
+            crate::app_update::Flow::Failed { .. }
+        );
         let tone = if failed { theme.danger } else { theme.accent };
         // Follow the selected spectrum with a low-emphasis glass tint rather
         // than painting the bright text accent as a solid slab.
@@ -8653,241 +8674,87 @@ impl Shell {
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(tone)
             .child(div().flex_1().min_w_0().child(label));
-        if clickable {
+        if action != crate::app_update::StripAction::None {
             strip = strip
                 .cursor_pointer()
                 .hover(move |s| s.bg(chip_bg_hover))
                 .on_click(
-                    cx.listener(move |this, _, window, cx| this.on_update_strip_click(window, cx)),
+                    cx.listener(move |this, _, _, cx| this.on_update_strip_click(action, cx)),
                 );
         }
         Some(strip.into_any_element())
     }
 
-    /// Newest release the desktop checker ([`crate::app_update`]) found, if
-    /// any. The fork's strip reads it from the `AppUpdate` global instead of
-    /// the old engine status frame.
-    fn latest_available(cx: &App) -> Option<String> {
-        crate::app_update::AppUpdate::global(cx)
-            .and_then(|update| update.read(cx).available().map(str::to_owned))
-    }
-
-    /// The update strip's label and click affordance per install kind. Desktop
-    /// update installs (macOS bundles, Windows portable packages) drive their
-    /// flow from the strip; managed installs apply the headless release from
-    /// the strip too (`ApplyUpdate`: stage + swap + service restart) — including
-    /// a fork build offered a fork (`-mael.N`) release, which stages
-    /// fork-aware. A fork build offered stock would be overwritten, so its
-    /// strip drafts a rebase session instead (see `open_fork_rebase_session`);
-    /// unmanaged installs (source builds, hand-copied binaries) are pointed
-    /// at the GitHub releases page.
-    fn update_strip_label(
-        install: &zeron_update::InstallKind,
-        flow: &UpdateFlow,
-        latest: &str,
-        fork: bool,
-    ) -> (SharedString, bool) {
-        // A fork build offered a stock release drafts a rebase session, never
-        // an apply — checked first so the label matches `on_update_strip_click`
-        // on every install kind (upstream now counts Linux managed installs
-        // as desktop-updateable, which would otherwise hide the fork guard).
-        if fork && !zeron_update::is_fork_version(latest) {
-            return (
-                format!("Update available — v{latest} · click to draft update session").into(),
-                true,
-            );
-        }
-        if install.supports_desktop_update() {
-            match flow {
-                UpdateFlow::Idle => (format!("Update available — v{latest}").into(), true),
-                UpdateFlow::Downloading => (format!("Downloading v{latest}…").into(), false),
-                UpdateFlow::Applying => (format!("Updating to v{latest}…").into(), false),
-                UpdateFlow::Ready(_) => ("Update ready — restart to apply".into(), true),
-                UpdateFlow::Failed(message) => (format!("Update failed: {message}").into(), true),
+    /// Download → the background stage; Restart → swap + relaunch; Explain →
+    /// the update dialog; advisory installs open their destination (if any),
+    /// then dismiss for this version.
+    fn on_update_strip_click(
+        &mut self,
+        action: crate::app_update::StripAction,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::app_update::{AppUpdate, StripAction};
+        let Some(update) = AppUpdate::global(cx) else {
+            return;
+        };
+        match action {
+            StripAction::None => {}
+            StripAction::Download => update.update(cx, |update, cx| update.start_download(cx)),
+            StripAction::Restart => {
+                if let Some(staged) = update.read(cx).staged() {
+                    self.apply_staged_update(staged, cx);
+                }
             }
-        } else if matches!(install, zeron_update::InstallKind::Managed { .. }) {
-            match flow {
-                UpdateFlow::Applying => (format!("Updating to v{latest}…").into(), false),
-                UpdateFlow::Failed(message) => (format!("Update failed: {message}").into(), true),
-                _ => (
-                    format!("Update available — v{latest} · click to update").into(),
-                    true,
-                ),
+            StripAction::Explain => update.update(cx, |update, cx| update.show_result(cx)),
+            StripAction::Advise { open_releases } => {
+                if open_releases {
+                    let page = update.read(cx).releases_page();
+                    cx.open_url(&page);
+                }
+                update.update(cx, |update, cx| update.dismiss_advisory(cx));
             }
-        } else {
-            (
-                format!("Update available — v{latest} · download from GitHub").into(),
-                true,
-            )
         }
     }
 
-    /// Idle → download; Ready → swap + relaunch; Failed → retry; managed
-    /// installs → the engine's `ApplyUpdate` (stages the headless release,
-    /// swaps it, restarts the service); a fork build offered stock opens a
-    /// rebase session instead (applying stock would overwrite the fork);
-    /// unmanaged installs → the GitHub releases page. Advisory paths dismiss
-    /// the strip for this version.
-    fn on_update_strip_click(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // A fork build offered stock: applying it would clobber the fork, so
-        // the strip drafts the rebase work as a new session instead — the
-        // user's own agent rebases, rebuilds, and reinstalls (see FORK.md).
-        if self.fork
-            && Self::latest_available(cx).is_some_and(|v| !zeron_update::is_fork_version(&v))
-        {
-            self.open_fork_rebase_session(window, cx);
-            return;
-        }
-        // Managed installs (stock, or a fork build offered a `-mael.N`
-        // release, which stages fork-aware): the engine updates itself in
-        // place. A fork build offered stock returns above with a rebase
-        // session. The strip waits on the RPC (stage + swap
-        // + service restart — the reply flushes before systemd kills the
-        // process), then hides: the fresh engine reports up to date when it
-        // rejoins.
-        let fork_apply = self.fork
-            && Self::latest_available(cx).is_some_and(|v| zeron_update::is_fork_version(&v));
-        if matches!(self.install, zeron_update::InstallKind::Managed { .. })
-            && (!self.fork || fork_apply)
-        {
-            if matches!(self.update_flow, UpdateFlow::Applying) {
-                return;
-            }
-            let Some(engine) = self.state.read(cx).engine().cloned() else {
-                self.update_flow = UpdateFlow::Failed("Engine not connected".into());
-                cx.notify();
-                return;
-            };
-            self.update_flow = UpdateFlow::Applying;
-            let apply = Tokio::spawn(cx, async move {
-                engine
-                    .client()
-                    .call(methods::APPLY_UPDATE, serde_json::json!({}))
-                    .await
-            });
-            self.update_task = Some(cx.spawn(async move |this, cx| {
-                let outcome = match apply.await {
-                    Ok(Ok(reply)) => Ok(reply
-                        .get("version")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)),
-                    Ok(Err(err)) => Err(format!("{err:#}")),
-                    Err(join_err) => Err(join_err.to_string()),
-                };
-                this.update(cx, |shell, cx| {
-                    shell.update_flow = match outcome {
-                        Ok(version) => {
-                            // Hide the strip until the restarted engine's
-                            // first status frame re-evaluates availability.
-                            shell.update_dismissed = version;
-                            UpdateFlow::Idle
-                        }
-                        Err(message) => UpdateFlow::Failed(message.into()),
-                    };
-                    cx.notify();
-                })
-                .ok();
-            }));
-            cx.notify();
-            return;
-        }
-        if !self.install.supports_desktop_update() {
-            if matches!(self.install, zeron_update::InstallKind::Unmanaged) {
-                cx.open_url(zeron_update::RELEASES_PAGE);
-            }
-            self.update_dismissed = Self::latest_available(cx);
-            cx.notify();
-            return;
-        }
-        match std::mem::replace(&mut self.update_flow, UpdateFlow::Idle) {
-            UpdateFlow::Idle | UpdateFlow::Failed(_) => self.begin_update_download(cx),
-            UpdateFlow::Downloading | UpdateFlow::Applying => {
-                self.update_flow = UpdateFlow::Downloading;
-            }
-            UpdateFlow::Ready(staged) => self.apply_staged_update(staged, cx),
-        }
-    }
-
-    /// Fork build offered a stock release: open a fresh session with the
-    /// fork-rebase runbook prefilled in the composer (not sent — the user
-    /// reviews, picks their harness, and sends). The agent does the
-    /// `zeron-fork-update` rebase + rebuild + install per FORK.md.
+    /// Account menu "Rebase onto upstream…" (fork builds): a fresh session
+    /// homed on the fork's clone with the rebase-and-release brief prefilled.
+    /// Not sent — the user picks the harness, reviews, and sends.
     fn open_fork_rebase_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let latest = Self::latest_available(cx).unwrap_or_default();
-        self.open_new_session(None, cx);
-        let prompt = Self::fork_rebase_prompt(&latest);
+        let clone = self.fork_clone_space(cx);
+        let clone_path = clone.as_ref().map(|(_, path)| path.clone());
+        self.open_new_session(clone.map(|(space_id, _)| space_id), cx);
+        let prompt = fork_rebase_prompt(
+            zeron_update::current_version(),
+            clone_path.as_deref(),
+            &zeron_update::fork_repo(),
+        );
         self.composer.update(cx, |composer, cx| {
             composer
                 .input
                 .update(cx, |input, cx| input.set_text(prompt, cx));
         });
-        self.update_dismissed = if latest.is_empty() {
-            None
-        } else {
-            Some(latest)
-        };
         window.focus(&self.composer.focus_handle(cx), cx);
         cx.notify();
     }
 
-    /// Premade prompt for the fork-update session: all the context an agent
-    /// needs to rebase the mael fork onto a stock upstream release, rebuild,
-    /// and reinstall — without the user re-explaining the fork layout.
-    fn fork_rebase_prompt(latest: &str) -> String {
-        let current = zeron_update::current_version();
-        let target = latest.trim().trim_start_matches('v');
-        format!(
-            "Update my mael fork of Zeron to the official upstream release v{target}.\n\
-            \n\
-            Context:\n\
-            - This app is itself the fork, currently version {current} (a `-mael.N` build).\n\
-            - The fork clone lives at ~/.build/zeron, branch `main` (tracks the mael fork on GitHub).\n\
-            - Upstream is https://github.com/zeronsh/zeron.git (remote `origin`; if a remote named `upstream` is missing, add it).\n\
-            - The full runbook is FORK.md in the repo root — follow it, especially the version rules and known conflict spots.\n\
-            \n\
-            Do the work:\n\
-            1. Fetch upstream tags and rebase the fork commits (everything on `main` past the upstream merge-base) onto v{target}, keeping the fork patches (droid harness, selfhost edge, fork identity).\n\
-            2. If the rebase conflicts, resolve the markers (known spots: workspace version in Cargo.toml, crates/harness/src/acp/mod.rs, crates/ui/src/settings/harnesses.rs, README harness lists) and continue — abort safely rather than shipping conflict markers.\n\
-            3. Bump the workspace version to `<upstream>-mael.<n>` (must be NEWER than both v{target} and {current} per the dotted-numeric compare — e.g. v{target} becomes {target}-mael.1, or bump N if that version exists).\n\
-            4. Rebuild in release mode: `cargo build --release -p zeron` (takes ~10 min; needs ~8 GB free under ~/.build/zeron/target).\n\
-            5. Install fork-aware: copy the binary to ~/.zeron/app/fork-<version>/zeron with the `.mael-fork` marker file, repoint the ~/.zeron/app/current symlink, relink ~/.local/bin/zeron, and refresh ~/.local/bin/zeron-fork-update from scripts/zeron-fork-update.sh. Never overwrite the binary in place while it runs. (`scripts/zeron-fork-update.sh v{target}` automates steps 1–5 — prefer it when it applies.)\n\
-            6. Tag `mael/v<version>` on the result.\n\
-            7. Verify with `~/.zeron/app/current/zeron --version` and `zeron status`. If this desktop app is running its own engine, skip the `zeron.service` restart (it would fail on the engine lock) and tell me to restart the desktop app instead.\n\
-            \n\
-            Do not push to GitHub unless I explicitly ask."
-        )
-    }
-
-    /// Fetch the manifest and stage the new Zeron desktop bundle under the data dir
-    /// (tokio — reqwest); the strip flips to "restart to apply" when done.
-    fn begin_update_download(&mut self, cx: &mut Context<Self>) {
-        let edge_url = self.boot.edge_url.clone();
-        let data_dir = self.data_dir.clone();
-        let install = self.install.clone();
-        self.update_flow = UpdateFlow::Downloading;
-        let download = Tokio::spawn(cx, async move {
-            let manifest = zeron_update::fetch_latest(&edge_url).await?;
-            install.stage_desktop(&edge_url, &manifest, &data_dir).await
-        });
-        self.update_task = Some(cx.spawn(async move |this, cx| {
-            let outcome = match download.await {
-                Ok(Ok(staged)) => Ok(staged),
-                Ok(Err(err)) => Err(format!("{err:#}")),
-                Err(join_err) => Err(join_err.to_string()),
-            };
-            this.update(cx, |shell, cx| {
-                shell.update_flow = match outcome {
-                    Ok(staged) => UpdateFlow::Ready(staged),
-                    Err(message) => {
-                        tracing::warn!(%message, "update download failed");
-                        UpdateFlow::Failed(message.into())
-                    }
-                };
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
+    /// This device's project for the fork clone, as `(space id, path)`: a
+    /// local space whose folder carries FORK.md — the one file that tells the
+    /// fork apart from an upstream checkout. The selected project wins when
+    /// several qualify.
+    fn fork_clone_space(&self, cx: &App) -> Option<(String, String)> {
+        let state = self.state.read(cx);
+        let local = state.local_device_id.as_deref()?;
+        let selected = state.selected_space.as_deref();
+        let mut clones: Vec<_> = state
+            .spaces_sorted()
+            .into_iter()
+            .filter(|space| space.device_id == local)
+            .filter(|space| std::path::Path::new(&space.path).join("FORK.md").is_file())
+            .collect();
+        clones.sort_by_key(|space| Some(space.id.as_str()) != selected);
+        clones
+            .first()
+            .map(|space| (space.id.clone(), space.path.clone()))
     }
 
     /// Swap the staged update over the installed one, arm the detached
@@ -8921,10 +8788,15 @@ impl Shell {
         let current = zeron_update::current_version();
         let (title, body, buttons): (SharedString, SharedString, Vec<UpdatePromptButton>) = {
             let update = update.read(cx);
+            let product = if update.is_fork() {
+                "Zeron fork"
+            } else {
+                "Zeron"
+            };
             match update.prompt()? {
                 Prompt::Checking => (
                     "Checking for updates…".into(),
-                    format!("You're on Zeron {current}.").into(),
+                    format!("You're on {product} {current}.").into(),
                     vec![UpdatePromptButton::Close("Cancel")],
                 ),
                 Prompt::CheckFailed(message) => (
@@ -8937,12 +8809,12 @@ impl Shell {
                 ),
                 Prompt::Result => match update.available() {
                     None => (
-                        "Zeron is up to date".into(),
+                        format!("{product} is up to date").into(),
                         format!("Version {current} is the newest release.").into(),
                         vec![UpdatePromptButton::Close("OK")],
                     ),
                     Some(latest) => {
-                        let title: SharedString = format!("Zeron {latest} is available").into();
+                        let title: SharedString = format!("{product} {latest} is available").into();
                         if let Some(blocker) = update.blocker() {
                             (
                                 title,
@@ -8969,9 +8841,13 @@ impl Shell {
                                     vec![UpdatePromptButton::Close("Hide")],
                                 ),
                                 Flow::Ready { version, .. } => (
-                                    format!("Zeron {version} is ready").into(),
-                                    "Restart to finish updating. If you don't, it installs the next time you quit Zeron."
-                                        .into(),
+                                    format!("{product} {version} is ready").into(),
+                                    if update.installs_on_quit() {
+                                        "Restart to finish updating. If you don't, it installs the next time you quit Zeron."
+                                    } else {
+                                        "Restart to finish updating."
+                                    }
+                                    .into(),
                                     vec![
                                         UpdatePromptButton::Close("Later"),
                                         UpdatePromptButton::Restart,
@@ -9057,10 +8933,16 @@ impl Shell {
                     popover::btn_primary(&theme, "Open download page")
                         .id("update-prompt-downloads")
                         .on_click(cx.listener(|_, _, _, cx| {
-                            cx.open_url(zeron_update::LATEST_RELEASE_PAGE);
-                            if let Some(update) = crate::app_update::AppUpdate::global(cx) {
-                                update.update(cx, |update, cx| update.dismiss_prompt(cx));
+                            let Some(update) = crate::app_update::AppUpdate::global(cx) else {
+                                cx.open_url(zeron_update::LATEST_RELEASE_PAGE);
+                                return;
+                            };
+                            if update.read(cx).is_fork() {
+                                cx.open_url(&update.read(cx).releases_page());
+                            } else {
+                                cx.open_url(zeron_update::LATEST_RELEASE_PAGE);
                             }
+                            update.update(cx, |update, cx| update.dismiss_prompt(cx));
                         }))
                 }
             });
@@ -9095,6 +8977,7 @@ impl Shell {
         let theme = &theme.for_popup();
         let open = self.user_menu.is_open();
         let action = account_menu_action(self.state.read(cx).workspace_scope, self.sync_flow);
+        let fork = crate::app_update::AppUpdate::global(cx).is_some_and(|u| u.read(cx).is_fork());
         // The profile pill hugs avatar + name (shrinking so long names fade
         // out); the gap between it and the settings button is not interactive.
         let initial: SharedString = user_line
@@ -9252,9 +9135,55 @@ impl Shell {
                     };
                     menu.child(row)
                 })
+                // Fork builds: the fork's own update (same checker + dialog as
+                // "Check for updates", fed by the fork's releases) and the
+                // upstream rebase brief.
+                .when(fork, |menu| {
+                    menu.child(popover::menu_heading(theme, "Fork"))
+                        .child(
+                            popover::menu_row(theme, false, "user-menu-fork-update")
+                                .id("user-menu-fork-update")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.close_user_menu(cx);
+                                    crate::app_update::check_for_updates(cx);
+                                }))
+                                .child(
+                                    icon(icons::REFRESH)
+                                        .size(px(16.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(SharedString::from("Update Zeron fork")),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(crate::typography::ui_rems(11.0))
+                                        .text_color(theme.text_muted)
+                                        .child(SharedString::from(zeron_update::current_version())),
+                                ),
+                        )
+                        .child(
+                            popover::menu_row(theme, false, "user-menu-fork-rebase")
+                                .id("user-menu-fork-rebase")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.close_user_menu(cx);
+                                    this.open_fork_rebase_session(window, cx);
+                                }))
+                                .child(
+                                    icon(icons::GIT_BRANCH)
+                                        .size(px(16.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Rebase onto upstream…")),
+                        )
+                })
                 // macOS keeps "Check for Updates…" in the app menu under
                 // About; elsewhere there is no app menu, so it lives here.
-                .when(!cfg!(target_os = "macos"), |menu| {
+                .when(!fork && !cfg!(target_os = "macos"), |menu| {
                     menu.child(
                         popover::menu_row(theme, false, "user-menu-check-updates")
                             .id("user-menu-check-updates")
@@ -9899,8 +9828,11 @@ impl Shell {
             // Escape reached the shell with nothing nearer wanting it (the
             // composer propagates without a mention popup to close; menus
             // and dialogs were resolved in the capture pass): a pair of them
-            // opens the rewind list.
-            ShellEscapeOutcome::Ignored if matches!(self.route, Route::Chat) => {
+            // opens the rewind list — main conversation only, since a rewind
+            // acts on the selected chat.
+            ShellEscapeOutcome::Ignored
+                if matches!(self.route, Route::Chat) && composer == self.composer =>
+            {
                 self.on_chat_escape(window, cx);
             }
             ShellEscapeOutcome::OtherKey | ShellEscapeOutcome::Ignored => {}
@@ -10075,12 +10007,7 @@ impl Shell {
 
     /// Run `CompactChat` with `model` (the picker-resolved summarizer).
     /// Errors surface on the composer so a failed compact is never silent.
-    fn compact_with(
-        &mut self,
-        chat_id: &str,
-        model: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
+    fn compact_with(&mut self, chat_id: &str, model: Option<String>, cx: &mut Context<Self>) {
         let Some(chat) = self
             .state
             .read(cx)
@@ -10089,6 +10016,10 @@ impl Shell {
             .find(|chat| chat.id == chat_id)
             .cloned()
         else {
+            tracing::warn!(%chat_id, "compact requested for an unknown chat");
+            self.composer.update(cx, |composer, cx| {
+                composer.show_error(SharedString::from("Could not compact: chat not found"), cx);
+            });
             return;
         };
         let device_id = chat.device_id.clone();
@@ -10099,6 +10030,16 @@ impl Shell {
             });
             return;
         };
+        // Droid replies once its `/compress` turn is queued (that turn shows
+        // in the transcript); OpenCode replies only after the summary, which
+        // never appears in the transcript, so it gets a success caption.
+        let summarized_inline = chat
+            .config
+            .as_ref()
+            .is_some_and(|config| config.harness == HarnessId::Opencode);
+        let activity = self.composer.update(cx, |composer, cx| {
+            composer.show_activity("Compacting this chat…", cx)
+        });
         cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
@@ -10111,17 +10052,34 @@ impl Shell {
                     }),
                 )
                 .await;
+            let succeeded = result.is_ok();
             let _ = this.update(cx, |this, cx| {
-                if let Err(error) = result {
-                    this.composer.update(cx, |composer, cx| {
-                        composer.show_error(
+                this.composer.update(cx, |composer, cx| {
+                    composer.clear_activity(&activity, cx);
+                    match result {
+                        Err(error) => composer.show_error(
                             SharedString::from(format!("Could not compact: {error}")),
                             cx,
-                        );
-                    });
-                }
+                        ),
+                        Ok(_) if summarized_inline => {
+                            composer.show_activity_for(
+                                &activity,
+                                "Compacted — the next message continues from the summary",
+                                cx,
+                            );
+                        }
+                        Ok(_) => {}
+                    }
+                });
                 cx.notify();
             });
+            if succeeded && summarized_inline {
+                cx.background_executor().timer(Duration::from_secs(6)).await;
+                let _ = this.update(cx, |this, cx| {
+                    this.composer
+                        .update(cx, |composer, cx| composer.clear_activity(&activity, cx));
+                });
+            }
         })
         .detach();
     }
@@ -10151,9 +10109,21 @@ impl Shell {
             });
             return;
         };
-        let Some(command) = cli_resume_command(config.harness, &session_id) else {
+        let Some((title, command)) = cli_resume_command(config.harness, &session_id) else {
             return;
         };
+        // Agent session stores are keyed by directory: resume where the
+        // session runs (a worktree, say), not the chat's default folder.
+        let cwd = chat
+            .harness_session_cwd
+            .clone()
+            .filter(|cwd| !cwd.trim().is_empty());
+        if self.state.read(cx).engine().is_none() {
+            self.composer.update(cx, |composer, cx| {
+                composer.show_error(SharedString::from("Engine not connected"), cx)
+            });
+            return;
+        }
         cx.notify();
         // Reveal the right host like any surface opener: a pushed surface
         // alone stays at width zero while the pane is closed.
@@ -10169,7 +10139,7 @@ impl Shell {
         let chat_id = chat.id.clone();
         let key = panel.update(cx, |panel, cx| {
             panel.set_open(true, cx);
-            panel.open_tab_for_chat(chat_id.clone(), cx)
+            panel.open_tab_for_chat(chat_id.clone(), title, cwd, cx)
         });
         if let Some(key) = key {
             self.right_tabs
@@ -10627,7 +10597,6 @@ impl Shell {
                 .into_any_element();
             overlays.push(popover::modal("delete-chat-dialog", viewport, card));
         }
-
 
         if let Some(flow) = self.discard_working_tree.clone() {
             let card = match flow {
@@ -12048,22 +12017,20 @@ impl Shell {
                 // up the carve-out. The bubble dispatch reaches the chip
                 // before the strip, and the handler consumes the drag, so
                 // the two never double-apply.
-                .on_drop::<RightTabDrag>(cx.listener(
-                    move |this, payload: &RightTabDrag, _, cx| {
-                        if payload.panel_key != this.panel_key(cx) {
-                            this.right_tab_drag = None;
-                            cx.notify();
-                            return;
-                        }
-                        let to = this
-                            .right_tab_drag
-                            .as_ref()
-                            .map(|d| d.over)
-                            .unwrap_or(payload.from);
+                .on_drop::<RightTabDrag>(cx.listener(move |this, payload: &RightTabDrag, _, cx| {
+                    if payload.panel_key != this.panel_key(cx) {
                         this.right_tab_drag = None;
-                        this.reorder_right_tabs(payload.from, to, cx);
-                    },
-                ))
+                        cx.notify();
+                        return;
+                    }
+                    let to = this
+                        .right_tab_drag
+                        .as_ref()
+                        .map(|d| d.over)
+                        .unwrap_or(payload.from);
+                    this.right_tab_drag = None;
+                    this.reorder_right_tabs(payload.from, to, cx);
+                }))
                 .child(
                     // Leading slot: the surface's icon.
                     div()
@@ -13855,12 +13822,17 @@ mod tests {
             assert!(!cli_managed(other), "{other:?} must not get the buttons");
         }
         assert_eq!(
-            cli_resume_command(Opencode, "ses_1").as_deref(),
-            Some("opencode --session ses_1")
+            cli_resume_command(Opencode, "ses_1"),
+            Some(("OpenCode", "opencode --session 'ses_1'".to_owned()))
         );
         assert_eq!(
-            cli_resume_command(Droid, "abc").as_deref(),
-            Some("droid --resume abc")
+            cli_resume_command(Droid, "abc"),
+            Some(("Droid", "droid --resume 'abc'".to_owned()))
+        );
+        assert_eq!(
+            cli_resume_command(Droid, "a'b; rm").map(|(_, command)| command),
+            Some(r"droid --resume 'a'\''b; rm'".to_owned()),
+            "ids are quoted, never spliced as shell syntax"
         );
         assert_eq!(cli_resume_command(Codex, "x"), None);
     }
@@ -13965,131 +13937,63 @@ mod tests {
 
         chat.sync_state = S::Waiting;
         chat.connected = false;
-        assert_eq!(chat_sync_pill_caption(&chat), Some("Sync queued — changes are saved"));
+        assert_eq!(
+            chat_sync_pill_caption(&chat),
+            Some("Sync queued — changes are saved")
+        );
         chat.sync_state = S::Connecting;
         assert_eq!(chat_sync_pill_caption(&chat), Some("Syncing…"));
         chat.sync_state = S::Offline;
-        assert_eq!(chat_sync_pill_caption(&chat), Some("Offline — changes are saved"));
+        assert_eq!(
+            chat_sync_pill_caption(&chat),
+            Some("Offline — changes are saved")
+        );
 
         // Real pending pushes remain visible even with a live room.
         chat.connected = true;
         chat.pending_pushes = 1;
         chat.sync_state = S::Waiting;
-        assert_eq!(chat_sync_pill_caption(&chat), Some("Sync queued — changes are saved"));
+        assert_eq!(
+            chat_sync_pill_caption(&chat),
+            Some("Sync queued — changes are saved")
+        );
         chat.sync_state = S::Connecting;
         assert_eq!(chat_sync_pill_caption(&chat), Some("Syncing…"));
     }
 
     #[test]
-    fn update_strip_labels_cover_every_install_kind() {
-        // Managed (curl|sh daemon layout), stock: the click path depends on
-        // whether the install self-updates in place (upstream counts Linux
-        // managed installs as desktop-updateable; elsewhere the engine's
-        // `ApplyUpdate` stages the headless release + restarts the service).
-        let managed = zeron_update::InstallKind::Managed {
-            app_root: PathBuf::from("/home/u/.zeron/app"),
-        };
-        let stock = Shell::update_strip_label(&managed, &UpdateFlow::Idle, "0.2.86", false);
-        if managed.supports_desktop_update() {
-            assert_eq!(stock.0, SharedString::from("Update available — v0.2.86"));
-        } else {
-            assert_eq!(
-                stock.0,
-                SharedString::from("Update available — v0.2.86 · click to update")
-            );
-        }
-        assert!(stock.1);
-        assert_eq!(
-            Shell::update_strip_label(&managed, &UpdateFlow::Applying, "0.2.86", false).0,
-            SharedString::from("Updating to v0.2.86…")
+    fn fork_rebase_prompt_carries_the_release_runbook() {
+        let prompt = fork_rebase_prompt("0.2.102-mael.5", Some("/home/u/zeron-fork"), "owner/fork");
+        assert!(
+            prompt.contains("0.2.102-mael.5"),
+            "names the installed fork"
+        );
+        assert!(prompt.contains("`/home/u/zeron-fork`"), "names the clone");
+        assert!(prompt.contains("FORK.md"), "points at the runbook");
+        assert!(
+            prompt.contains("https://github.com/owner/fork"),
+            "names the fork remote"
         );
         assert!(
-            !Shell::update_strip_label(&managed, &UpdateFlow::Applying, "0.2.86", false).1
-        );
-        // Managed, fork build offered stock: applying it would clobber the
-        // fork — the strip drafts a rebase session instead, on every install
-        // kind (the guard runs before the desktop branch).
-        let fork = Shell::update_strip_label(&managed, &UpdateFlow::Idle, "0.2.86", true);
-        assert_eq!(
-            fork.0,
-            SharedString::from("Update available — v0.2.86 · click to draft update session")
-        );
-        assert!(fork.1);
-        let mac_app = zeron_update::InstallKind::MacApp {
-            bundle: PathBuf::from("/Applications/Zeron.app"),
-        };
-        let fork_mac = Shell::update_strip_label(&mac_app, &UpdateFlow::Idle, "0.2.86", true);
-        assert_eq!(
-            fork_mac.0,
-            SharedString::from("Update available — v0.2.86 · click to draft update session")
-        );
-        // The drafted prompt carries the target version and the runbook.
-        let prompt = Shell::fork_rebase_prompt("0.2.101");
-        assert!(prompt.contains("v0.2.101"), "prompt names the target");
-        assert!(prompt.contains("FORK.md"), "prompt points at the runbook");
-        assert!(prompt.contains("zeron-fork-update"), "prompt names the helper");
-        assert!(
-            prompt.contains("Do not push"),
-            "prompt withholds pushing by default"
-        );
-        // Managed, fork build offered a `-mael.N` release: the normal flow
-        // (one-click apply; staging is fork-aware).
-        let fork_release =
-            Shell::update_strip_label(&managed, &UpdateFlow::Idle, "0.2.96-mael.2", true);
-        if managed.supports_desktop_update() {
-            assert_eq!(
-                fork_release.0,
-                SharedString::from("Update available — v0.2.96-mael.2")
-            );
-        } else {
-            assert_eq!(
-                fork_release.0,
-                SharedString::from("Update available — v0.2.96-mael.2 · click to update")
-            );
-        }
-        assert!(fork_release.1);
-        // Unmanaged (source builds, hand-copied binaries — bare Windows
-        // release exes): the GitHub releases page, clickable to open it.
-        let unmanaged = Shell::update_strip_label(
-            &zeron_update::InstallKind::Unmanaged,
-            &UpdateFlow::Idle,
-            "0.2.86",
-            false,
-        );
-        assert_eq!(
-            unmanaged.0,
-            SharedString::from("Update available — v0.2.86 · download from GitHub")
-        );
-        assert!(unmanaged.1);
-        // Downloading is not clickable (desktop flow) and the flow labels stay
-        // untouched for the installs that own them.
-        let mac_app = zeron_update::InstallKind::MacApp {
-            bundle: PathBuf::from("/Applications/Zeron.app"),
-        };
-        assert_eq!(
-            Shell::update_strip_label(&mac_app, &UpdateFlow::Downloading, "0.2.86", false).0,
-            SharedString::from("Downloading v0.2.86…")
+            prompt.contains("https://github.com/zeronsh/zeron.git"),
+            "names upstream"
         );
         assert!(
-            !Shell::update_strip_label(&mac_app, &UpdateFlow::Downloading, "0.2.86", false).1
+            prompt.contains("backup/pre-rebase-v0.2.102-mael.5"),
+            "backs up before rewriting"
         );
-        assert_eq!(
-            Shell::update_strip_label(&mac_app, &UpdateFlow::Idle, "0.2.86", false).0,
-            SharedString::from("Update available — v0.2.86")
+        assert!(
+            prompt.contains("--force-with-lease"),
+            "never a blind force push"
         );
-    }
+        assert!(
+            prompt.contains("vX.Y.Z-mael.1") && !prompt.contains("mael/v"),
+            "release tags have no slash (slashes break release downloads)"
+        );
 
-    #[cfg(windows)]
-    #[test]
-    fn windows_portable_strip_drives_the_desktop_flow() {
-        let portable = zeron_update::InstallKind::WindowsPortable {
-            directory: PathBuf::from(r"C:\Users\u\AppData\Local\Programs\Zeron"),
-        };
-        assert_eq!(
-            Shell::update_strip_label(&portable, &UpdateFlow::Idle, "0.2.86", false).0,
-            SharedString::from("Update available — v0.2.86")
-        );
-        assert!(Shell::update_strip_label(&portable, &UpdateFlow::Idle, "0.2.86", false).1);
+        let without_clone = fork_rebase_prompt("0.2.102-mael.5", None, "owner/fork");
+        assert!(without_clone.contains("~/.build/zeron"));
+        assert!(without_clone.contains("clone https://github.com/owner/fork.git"));
     }
 
     #[test]
@@ -15602,7 +15506,8 @@ mod exit_regressions {
                     settings::update(settings::SavePolicy::Immediate, cx, |settings| {
                         settings.wallpaper_folder = Some(dir.path().join("wallpapers"));
                         settings.wallpaper_source = Some(dir.path().join("wallpapers/current.png"));
-                        settings.wallpaper_history = vec![dir.path().join("wallpapers/current.png")];
+                        settings.wallpaper_history =
+                            vec![dir.path().join("wallpapers/current.png")];
                         settings.window_geometry = geometry;
                         settings.open_web_links_in_zeron = open_links_in_zeron;
                         settings.terminal_font_family = terminal_family.clone();
@@ -15624,8 +15529,14 @@ mod exit_regressions {
                         shell.settings.terminal_height = 300.0 + step as f32;
                         shell.schedule_save(cx);
                         let current = settings::current(cx);
-                        assert_eq!(current.wallpaper_history, vec![dir.path().join("wallpapers/current.png")]);
-                        assert_eq!(current.wallpaper_folder, Some(dir.path().join("wallpapers")));
+                        assert_eq!(
+                            current.wallpaper_history,
+                            vec![dir.path().join("wallpapers/current.png")]
+                        );
+                        assert_eq!(
+                            current.wallpaper_folder,
+                            Some(dir.path().join("wallpapers"))
+                        );
                         assert_eq!(
                             current.wallpaper_source,
                             Some(dir.path().join("wallpapers/current.png"))
@@ -15653,7 +15564,10 @@ mod exit_regressions {
                     settings::flush(cx);
                     let loaded = settings::UiSettings::load(dir.path());
                     assert_eq!(loaded.window_geometry, geometry);
-                    assert_eq!(loaded.wallpaper_history, vec![dir.path().join("wallpapers/current.png")]);
+                    assert_eq!(
+                        loaded.wallpaper_history,
+                        vec![dir.path().join("wallpapers/current.png")]
+                    );
                     assert_eq!(loaded.wallpaper_folder, Some(dir.path().join("wallpapers")));
                     assert_eq!(
                         loaded.wallpaper_source,
@@ -16083,7 +15997,7 @@ mod exit_regressions {
     }
 
     #[gpui::test]
-    fn open_cli_in_terminal_reveals_a_terminal(cx: &mut TestAppContext) {
+    fn open_cli_in_terminal_without_an_engine_opens_nothing(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         cx.update(|cx| {
             gpui_base::init(cx);
@@ -16135,23 +16049,18 @@ mod exit_regressions {
 
                 shell.open_cli_in_terminal(cx);
                 let key = shell.panel_key(cx);
+                // With no engine no PTY can open; the command must never be
+                // typed into whichever tab last held the newest key.
                 assert!(
-                    shell.panels.get(&key).changes_open,
-                    "the right host opens with the surface"
+                    !shell.right_tabs.get(&key).is_some_and(|tabs| tabs
+                        .iter()
+                        .any(|surface| matches!(surface, RightSurface::Terminal(_)))),
+                    "no terminal surface without a backing tab"
                 );
                 assert!(
-                    shell
-                        .right_tabs
-                        .get(&key)
-                        .is_some_and(|tabs| tabs
-                            .iter()
-                            .any(|surface| matches!(surface, RightSurface::Terminal(_)))),
-                    "a terminal surface is pushed"
+                    !shell.panels.get(&key).changes_open,
+                    "the right host stays closed"
                 );
-                // `resolved_right_active` needs the tab's backing PTY (an
-                // engine), so activation itself is not assertable here; the
-                // pushed surface plus the opened host is the regression
-                // (a surface alone stays at width zero).
             })
             .unwrap();
     }
@@ -16378,7 +16287,10 @@ mod exit_regressions {
                 });
                 shell.settings.space_filter = None;
                 shell.open_chat("elsewhere".into(), cx);
-                assert_eq!(shell.state.read(cx).selected_space.as_deref(), Some("other"));
+                assert_eq!(
+                    shell.state.read(cx).selected_space.as_deref(),
+                    Some("other")
+                );
                 shell.open_new_session(None, cx);
                 let state = shell.state.read(cx);
                 assert!(state.selected_chat.is_none());

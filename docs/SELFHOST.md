@@ -79,6 +79,10 @@ and the in-app auto-update log a warning and do nothing; update the binary
 the way you installed it. Publishing your own builds into the `RELEASES`
 bucket makes the normal flow work again.
 
+Fork builds (versions like `0.2.102-mael.6`) also read the fork's GitHub
+releases, so **Update Zeron fork** in the account menu works against a
+self-hosted edge with no `RELEASES` bucket.
+
 ### TLS
 
 workerd serves plain HTTP. For anything beyond one machine, terminate TLS

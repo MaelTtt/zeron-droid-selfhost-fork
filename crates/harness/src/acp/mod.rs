@@ -400,7 +400,7 @@ fn droid_permission_option() -> ModelOption {
 
 fn droid_install_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::executable::home_dir() {
         dirs.push(home.join(".local").join("bin").join("droid"));
         dirs.push(home.join(".factory").join("bin").join("droid"));
     }
@@ -2218,26 +2218,27 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
         .collect()
 }
 
-/// A session config option surfaced as a Traits-dropdown section. Model rides
-/// the model rows and thought_level is the Reasoning ladder. Mode (Claude
-/// bypass, Codex full-access, Droid autonomy / permission) is a trait the
-/// user can see and change; the no-prompts value is the default so the chip
-/// matches the unattended session. Everything else the agent advertises
-/// (fast mode, collaboration mode, agent persona, …) passes through.
-/// `currentValue` doubles as the default when no no-prompts value exists.
-/// Booleans render as an off/on select, mirroring the catalogs (zeron never
-/// declares the boolean config capability, so adapters send selects, but
-/// handle the shape defensively).
+/// A session config option surfaced as a Traits-dropdown section. Mode is
+/// zeron's own (forced to the no-prompts choice; upstream's permission
+/// control owns it) except Droid's autonomy level, which surfaces as a
+/// "Permission" trait defaulting to the no-prompts value. Model rides the
+/// model rows, and thought_level is the Reasoning ladder — everything else
+/// the agent advertises (fast mode, collaboration mode, agent persona, …)
+/// passes through. `currentValue` doubles as the default: it is the state
+/// the session opens in. Booleans render as an off/on select, mirroring the
+/// catalogs (zeron never declares the boolean config capability, so adapters
+/// send selects, but handle the shape defensively).
 fn trait_from_config_option(option: &Value) -> Option<ModelOption> {
-    if matches!(
-        option.get("category").and_then(Value::as_str),
-        Some("model" | "thought_level")
-    ) {
-        return None;
-    }
     let id = option.get("id").and_then(Value::as_str)?;
     let category = option.get("category").and_then(Value::as_str);
-    let label = if category == Some("mode") && (id == "autonomy_level" || id == "autonomyLevel") {
+    let droid_autonomy =
+        category == Some("mode") && matches!(id, "autonomy_level" | "autonomyLevel");
+    if matches!(category, Some("model" | "thought_level"))
+        || (category == Some("mode") && !droid_autonomy)
+    {
+        return None;
+    }
+    let label = if droid_autonomy {
         "Permission"
     } else {
         option.get("name").and_then(Value::as_str).unwrap_or(id)
@@ -3043,23 +3044,20 @@ fn session_update_events(
 
 /// Keep only genuine model changes: `config_option_update` re-emits the full
 /// option set on every settings change, so an unchanged model must not chip.
-/// A change fills `from` from the session's last known value (None = unknown).
-fn dedup_model_switches(
-    events: Vec<AgentEvent>,
-    model: &mut Option<String>,
-) -> Vec<AgentEvent> {
+/// A change fills `from` from the session's last known value. With no known
+/// value (the run picked no model) the first report is the session's
+/// starting model, not a switch, so it only seeds.
+fn dedup_model_switches(events: Vec<AgentEvent>, model: &mut Option<String>) -> Vec<AgentEvent> {
     events
         .into_iter()
         .filter_map(|event| match event {
-            AgentEvent::ModelSwitched { to, .. } => {
-                if model.as_deref() == Some(to.as_str()) {
-                    None
-                } else {
-                    let from = model.take();
-                    *model = Some(to.clone());
-                    Some(AgentEvent::ModelSwitched { from, to })
-                }
-            }
+            AgentEvent::ModelSwitched { to, .. } => match model.replace(to.clone()) {
+                Some(from) if from != to => Some(AgentEvent::ModelSwitched {
+                    from: Some(from),
+                    to,
+                }),
+                _ => None,
+            },
             other => Some(other),
         })
         .collect()
@@ -5086,7 +5084,11 @@ mod tests {
         );
         for path in [r"C:\semi;colon\zeron.exe", r"C:\percent%s\zeron.exe"] {
             assert!(windows_noop_browser(Path::new(path)).is_err());
-        }    fn model_switch_dedup_fills_from_and_drops_noops() {
+        }
+    }
+
+    #[test]
+    fn model_switch_dedup_fills_from_and_drops_noops() {
         let mut model: Option<String> = Some("gpt-5.6-sol".into());
         let events = vec![
             AgentEvent::TextDelta { text: "hi".into() },
@@ -5127,22 +5129,20 @@ mod tests {
     #[test]
     fn model_switch_dedup_seeds_from_unknown() {
         let mut model: Option<String> = None;
-        let out = dedup_model_switches(
-            vec![AgentEvent::ModelSwitched {
-                from: None,
-                to: "auto".into(),
-            }],
-            &mut model,
-        );
+        let switch = |to: &str| AgentEvent::ModelSwitched {
+            from: None,
+            to: to.into(),
+        };
+        let out = dedup_model_switches(vec![switch("auto"), switch("glm-5.2")], &mut model);
         assert_eq!(
             out,
             vec![AgentEvent::ModelSwitched {
-                from: None,
-                to: "auto".into(),
-            }]
+                from: Some("auto".into()),
+                to: "glm-5.2".into(),
+            }],
+            "the first report seeds silently; later changes chip"
         );
-        assert_eq!(model.as_deref(), Some("auto"));
-    }
+        assert_eq!(model.as_deref(), Some("glm-5.2"));
     }
 
     #[test]
@@ -5845,19 +5845,17 @@ mod tests {
         assert_eq!(models[0].label, "GPT-5.6-Sol");
         assert_eq!(models[0].description.as_deref(), Some("Frontier"));
         assert!(models[0].reasoning_levels.contains(&ReasoningLevel::Ultra));
-        // Wire config options become traits; model/thought_level do not.
-        // Mode is a visible permission trait whose default is the no-prompts value.
+        // Wire config options become traits; mode/model/thought_level do not
+        // (only Droid's autonomy level surfaces, as "Permission").
         assert_eq!(
             models[0]
                 .options
                 .iter()
                 .map(|o| o.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["mode", "fast-mode"]
+            vec!["fast-mode"]
         );
-        assert_eq!(models[0].options[0].label, "Mode");
-        assert_eq!(models[0].options[0].default_choice, "agent-full-access");
-        assert_eq!(models[0].options[1].default_choice, "off");
+        assert_eq!(models[0].options[0].default_choice, "off");
     }
 
     #[test]

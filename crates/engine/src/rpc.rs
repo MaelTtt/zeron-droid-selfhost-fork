@@ -1320,6 +1320,9 @@ fn forward_deadline(method: &str) -> std::time::Duration {
         // queueing, verification, and the relayed response itself.
         methods::APPLY_HARNESS_UPDATE => Duration::from_secs(20 * 60),
         methods::CREATE_WORKTREE => Duration::from_secs(120),
+        // OpenCode compaction waits out a full summary model call (up to
+        // 10 minutes) plus server startup.
+        methods::COMPACT_CHAT => Duration::from_secs(12 * 60),
         // Allow the adapter discovery budget plus relay and shutdown overhead.
         methods::LIST_MODELS | methods::LIST_COMMANDS => Duration::from_secs(100),
         _ => Duration::from_secs(30),
@@ -1959,7 +1962,7 @@ impl RpcService for EngineRpc {
                             reasoning: config.reasoning,
                             model_options: config.model_options.clone(),
                             cwd,
-                            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+                            sandbox: config.sandbox,
                             auto_approve: false,
                             resume: None,
                             attachments: Vec::new(),

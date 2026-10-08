@@ -475,12 +475,18 @@ impl TerminalPanel {
         Some(self.tab_seq)
     }
 
-    /// Open a tab for an explicit chat (the open-in-CLI dialog's chat, which
-    /// may differ from the selection). Mirrors [`Self::open_tab_for_selected`].
-    pub fn open_tab_for_chat(&mut self, chat: String, cx: &mut Context<Self>) -> Option<u64> {
-        self.open_tab(chat, cx);
+    /// Open a titled tab for an explicit chat in `cwd` (open-in-terminal:
+    /// the agent CLI resumes from the session's own directory).
+    pub fn open_tab_for_chat(
+        &mut self,
+        chat: String,
+        title: impl Into<SharedString>,
+        cwd: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Option<u64> {
+        let key = self.open_tab_with(chat, Some(title.into()), cwd, cx)?;
         self.request_focus(cx);
-        Some(self.tab_seq)
+        Some(key)
     }
 
     /// Create a named placeholder tab without opening a PTY. Project Actions
@@ -667,22 +673,36 @@ impl TerminalPanel {
 
     // ---- open / stream lifecycle ----
 
-    fn open_tab(&mut self, chat: String, cx: &mut Context<Self>) {
-        let Some(engine) = self.engine(cx) else {
-            return;
-        };
-        let tab_no = self
-            .chats
-            .get(&chat)
-            .map_or(1, |entry| entry.tabs.len() + 1);
-        let key = self.reserve_tab_for_chat(chat.clone(), format!("Terminal {tab_no}"), cx);
+    fn open_tab(&mut self, chat: String, cx: &mut Context<Self>) -> Option<u64> {
+        self.open_tab_with(chat, None, None, cx)
+    }
+
+    /// `None` when no tab opened (no engine yet) — callers must not fall back
+    /// to whatever tab already holds the latest key.
+    fn open_tab_with(
+        &mut self,
+        chat: String,
+        title: Option<SharedString>,
+        cwd: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Option<u64> {
+        let engine = self.engine(cx)?;
+        let title = title.unwrap_or_else(|| {
+            let tab_no = self
+                .chats
+                .get(&chat)
+                .map_or(1, |entry| entry.tabs.len() + 1);
+            format!("Terminal {tab_no}").into()
+        });
+        let key = self.reserve_tab_for_chat(chat.clone(), title, cx);
         let target = self.chat_target(&chat, cx);
-        let cwd = self.state.read(cx).terminal_open_cwd_for(&chat);
+        let cwd = cwd.or_else(|| self.state.read(cx).terminal_open_cwd_for(&chat));
         let run = Self::spawn_session(chat.clone(), key, engine, target, None, cwd, cx);
         if let Some(tab) = self.tab_mut(&chat, key) {
             tab._run = Some(run);
         }
         cx.notify();
+        Some(key)
     }
 
     /// OpenTerminal, then pump SubscribeTerminal with reconnect backoff.

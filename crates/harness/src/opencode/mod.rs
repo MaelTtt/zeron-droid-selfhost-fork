@@ -84,6 +84,12 @@ const HEALTH_POLL: Duration = Duration::from_millis(150);
 /// to the generation that launched it.
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Compaction is a full model call over the whole transcript; long sessions
+/// on slow models take minutes.
+const COMPACT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const COMPACT_START_GRACE: Duration = Duration::from_secs(15);
+const COMPACT_POLL: Duration = Duration::from_millis(500);
+
 /// Bus reconnect: the server is our own child on loopback, so a dropped
 /// stream with a live process is transient — retry briefly, then treat the
 /// run as dead (transcript integrity is gone once frames are missed).
@@ -336,14 +342,17 @@ impl OpencodeHarness {
         result
     }
 
-    /// Queue a durable compaction request on an existing session
-    /// (`POST /api/session/{id}/compact`). Compaction uses the session's
+    /// Compact an existing session. 2.x queues the request
+    /// (`POST /api/session/{id}/compact`) and compaction uses the session's
     /// model, so an optional `model` (`provider/id`) is applied to the
-    /// session first — that is how a compaction model is chosen.
+    /// session first. 1.x summarizes synchronously
+    /// (`POST /session/{id}/summarize`) and takes the model in the body,
+    /// defaulting to the session's last assistant model.
     ///
-    /// The call admits the request and returns; the summary generates
-    /// server-side. Callers must refuse while a turn is in flight (like
-    /// rewind): a second server process must not race the live run.
+    /// The summary generates inside the server process, so a server this
+    /// call spawned is kept alive until the session is idle again. Callers
+    /// must refuse while a turn is in flight (like rewind): a second server
+    /// process must not race the live run.
     pub async fn compact(
         &self,
         session_id: &str,
@@ -379,24 +388,28 @@ impl OpencodeHarness {
                         .await?;
                 }
                 let path = format!("/api/session/{session_id}/compact");
-                server
-                    .post_json(&path, cwd, &json!({}))
-                    .await
-                    .map(|_| ())
+                server.post_json(&path, cwd, &json!({})).await?;
             } else {
-                // 1.x documents no compact route; try the analogous path
-                // before sending the user to the TUI.
-                let path = format!("/session/{session_id}/compact");
-                server
-                    .post_json(&path, cwd, &json!({}))
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| {
-                        HarnessError::Protocol(format!(
-                            "{e} (this opencode server has no compact API — run /compact in its TUI)"
-                        ))
-                    })
+                let (provider, model_id) = match wanted {
+                    Some((provider, model_id)) => (provider.to_owned(), model_id.to_owned()),
+                    None => server.last_assistant_model(session_id, cwd).await?,
+                };
+                let path = format!("/session/{session_id}/summarize");
+                let body = json!({ "providerID": provider, "modelID": model_id });
+                let (status, text) = server
+                    .post_json_raw_with(&path, cwd, &body, COMPACT_TIMEOUT)
+                    .await?;
+                if !status.is_success() {
+                    return Err(HarnessError::Protocol(format!(
+                        "{} (run /compact in the opencode TUI instead)",
+                        post_error_message(&path, status, &text)
+                    )));
+                }
             }
+            if server.child.is_some() {
+                server.wait_until_idle(session_id, cwd).await?;
+            }
+            Ok(())
         }
         .await;
         server.shutdown(self.kill_grace).await;
@@ -877,9 +890,20 @@ impl Server {
         directory: Option<&str>,
         body: &Value,
     ) -> Result<(reqwest::StatusCode, String), HarnessError> {
+        self.post_json_raw_with(path, directory, body, CALL_TIMEOUT)
+            .await
+    }
+
+    async fn post_json_raw_with(
+        &self,
+        path: &str,
+        directory: Option<&str>,
+        body: &Value,
+        timeout: Duration,
+    ) -> Result<(reqwest::StatusCode, String), HarnessError> {
         let req = self
             .request(reqwest::Method::POST, path)
-            .timeout(CALL_TIMEOUT)
+            .timeout(timeout)
             .json(body);
         let resp = self
             .scoped(req, directory)
@@ -983,6 +1007,64 @@ impl Server {
         Ok(map
             .get(session_id)
             .is_some_and(|state| state.get("type").and_then(Value::as_str) != Some("idle")))
+    }
+
+    /// Block until a just-requested compaction has run. The run may not
+    /// have registered as active yet when this starts, so a session that
+    /// never shows as running within [`COMPACT_START_GRACE`] counts as
+    /// already done.
+    async fn wait_until_idle(
+        &self,
+        session_id: &str,
+        directory: Option<&str>,
+    ) -> Result<(), HarnessError> {
+        let started = tokio::time::Instant::now();
+        let mut seen_running = false;
+        loop {
+            match self.session_running(session_id, directory).await {
+                Ok(true) => seen_running = true,
+                Ok(false) if seen_running || started.elapsed() >= COMPACT_START_GRACE => {
+                    return Ok(());
+                }
+                Ok(false) | Err(_) => {}
+            }
+            if started.elapsed() >= COMPACT_TIMEOUT {
+                return Err(HarnessError::Protocol(format!(
+                    "compaction did not finish within {} minutes",
+                    COMPACT_TIMEOUT.as_secs() / 60
+                )));
+            }
+            tokio::time::sleep(COMPACT_POLL).await;
+        }
+    }
+
+    /// 1.x summarize needs an explicit model; the session's own is the one
+    /// its last assistant message ran on.
+    async fn last_assistant_model(
+        &self,
+        session_id: &str,
+        directory: Option<&str>,
+    ) -> Result<(String, String), HarnessError> {
+        let messages = self
+            .get_json(&format!("/session/{session_id}/message"), directory)
+            .await?;
+        messages
+            .as_array()
+            .into_iter()
+            .flatten()
+            .rev()
+            .filter_map(|message| message.get("info"))
+            .filter(|info| info.get("role").and_then(Value::as_str) == Some("assistant"))
+            .find_map(|info| {
+                let provider = info.get("providerID")?.as_str()?;
+                let model = info.get("modelID")?.as_str()?;
+                Some((provider.to_owned(), model.to_owned()))
+            })
+            .ok_or_else(|| {
+                HarnessError::Protocol(
+                    "this session has no model to compact with yet — pick one".into(),
+                )
+            })
     }
 
     /// End the live turn.

@@ -75,7 +75,8 @@ fn install_hint(harness: HarnessId, enabled: bool, can_install: bool) -> String 
         } else {
             "Set ANTIGRAVITY_ACP_EXECUTABLE to enable Antigravity"
         }
-        .into();    }
+        .into();
+    }
     let hint = if enabled {
         format!(
             "{} CLI not installed — turn it off or install it",
