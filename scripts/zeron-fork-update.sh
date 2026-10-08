@@ -10,7 +10,7 @@
 #   zeron-fork-update [vX.Y.Z]     # explicit upstream tag (default: newest v* tag)
 #
 # Optional env:
-#   CLONE_DIR   (default: $HOME/.build/zeron — the install clone)
+#   CLONE_DIR   (default: the fork clone you run this from, else $HOME/.build/zeron)
 #   UPSTREAM    (default: https://github.com/zeronsh/zeron.git)
 #   SKIP_DAEMON=1 (don't touch the systemd engine service)
 #
@@ -18,7 +18,14 @@
 # recovery command (see FORK.md).
 set -euo pipefail
 
-CLONE_DIR="${CLONE_DIR:-$HOME/.build/zeron}"
+if [ -z "${CLONE_DIR:-}" ]; then
+    here="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    if [ -n "$here" ] && [ -f "$here/FORK.md" ]; then
+        CLONE_DIR="$here"
+    else
+        CLONE_DIR="$HOME/.build/zeron"
+    fi
+fi
 UPSTREAM_URL="${UPSTREAM:-https://github.com/zeronsh/zeron.git}"
 
 say() { printf '\n\033[1;35m==> %s\033[0m\n' "$*"; }
@@ -38,6 +45,26 @@ if ! git remote get-url upstream >/dev/null 2>&1; then
     say "adding upstream remote ($UPSTREAM_URL)"
     git remote add upstream "$UPSTREAM_URL"
 fi
+say "backing up chat stores"
+# Chats live in per-identity stores (orgs/<org>/<user>, profiles/local). A restart
+# that resolves a different identity looks like lost sessions; keep a snapshot.
+ZDATA="$HOME/.zeron"
+BK="$ZDATA/backups/pre-update-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$BK"
+for store in "$ZDATA"/orgs/*/* "$ZDATA"/profiles/*; do
+    [ -f "$store/docs.sqlite3" ] || continue
+    dest="$BK/${store#"$ZDATA"/}"
+    mkdir -p "$dest"
+    if command -v sqlite3 >/dev/null 2>&1; then
+        sqlite3 "$store/docs.sqlite3" ".backup '$dest/docs.sqlite3'" || cp -a "$store/docs.sqlite3"* "$dest/"
+    else
+        cp -a "$store/docs.sqlite3"* "$dest/"
+    fi
+    [ -d "$store/journals" ] && cp -a "$store/journals" "$dest/"
+    [ -f "$store/previews.json" ] && cp -a "$store/previews.json" "$dest/"
+done
+ls -1d "$ZDATA"/backups/pre-update-* 2>/dev/null | sort | head -n -5 | xargs -r rm -rf
+
 say "fetching upstream tags"
 git fetch upstream --tags -q
 
@@ -120,21 +147,51 @@ ls -1d "$HOME/.zeron/app/fork-"[0-9]* 2>/dev/null \
   | sort -V | head -n -2 | xargs -r rm -rf
 
 mkdir -p "$HOME/.local/bin"
-ln -sf "$HOME/.zeron/app/current/zeron" "$HOME/.local/bin/zeron"
+# Every launch path must load ~/.zeron/env like the systemd unit does, or the
+# app resolves a different identity and opens a different chat store.
+cat > "$HOME/.zeron/zeron-launch" <<'LAUNCH'
+#!/bin/sh
+# Every launch path must share the engine identity from ~/.zeron/env, or Zeron opens a different chat store.
+set -a
+[ -f "$HOME/.zeron/env" ] && . "$HOME/.zeron/env"
+set +a
+exec "$HOME/.zeron/app/current/zeron" "$@"
+LAUNCH
+chmod +x "$HOME/.zeron/zeron-launch"
+ln -sfn "$HOME/.zeron/zeron-launch" "$HOME/.local/bin/zeron"
 cp "$CLONE_DIR/scripts/zeron-fork-update.sh" "$HOME/.local/bin/zeron-fork-update"
 chmod +x "$HOME/.local/bin/zeron-fork-update"
 
-if git rev-parse -q --verify "refs/tags/mael/v$NEWVER" >/dev/null; then
-    say "tag mael/v$NEWVER already exists"
+# The tag must carry the bumped version: fork-release CI rejects a tag that
+# doesn't match Cargo.toml.
+if ! git diff --quiet -- Cargo.toml Cargo.lock; then
+    git commit -q -m "mael: $NEWVER on upstream $TARGET" -- Cargo.toml Cargo.lock
+    say "committed the version bump"
+fi
+
+# Slashless tags only: `mael/v...` breaks GitHub release-download URLs.
+if git rev-parse -q --verify "refs/tags/v$NEWVER" >/dev/null; then
+    say "tag v$NEWVER already exists"
 else
-    git tag "mael/v$NEWVER"
-    say "tagged mael/v$NEWVER (push with: git push origin main mael/v$NEWVER)"
+    git tag "v$NEWVER"
+    say "tagged v$NEWVER — publish to your other devices with:
+  git push --force-with-lease origin main v$NEWVER"
 fi
 
 if [ "${SKIP_DAEMON:-0}" != "1" ]; then
     say "restarting engine"
     systemctl --user restart zeron.service 2>/dev/null || true
 fi
+
+# Warn when chat stores diverge: the engine opens exactly one of them.
+ACTIVE="$(ls -l /proc/"$(systemctl --user show -p MainPID --value zeron.service 2>/dev/null)"/fd 2>/dev/null \
+    | grep -o "$HOME/.zeron/[^ ]*/docs.sqlite3$" | head -n 1 | xargs -r dirname)"
+for store in "$HOME"/.zeron/orgs/*/* "$HOME"/.zeron/profiles/*; do
+    [ -f "$store/docs.sqlite3" ] || continue
+    [ "$store" = "$ACTIVE" ] && continue
+    n="$(ls "$store/journals" 2>/dev/null | wc -l)"
+    [ "$n" -gt 0 ] && printf '\033[1;33m!! inactive chat store %s (%s journals). Active: %s\033[0m\n' "$store" "$n" "${ACTIVE:-none}"
+done
 
 say "done"
 "$HOME/.local/bin/zeron" status

@@ -9,12 +9,19 @@
 #   curl -fsSL https://raw.githubusercontent.com/MaelTtt/zeron-droid-selfhost-fork/main/scripts/install-desktop.sh | bash
 # ...or clone first and run ./scripts/install-desktop.sh
 #
+# Installs the newest prebuilt fork release (GitHub releases, sha256-checked);
+# builds from source only when none is usable. After that, the account menu's
+# "Update Zeron fork" keeps the device current.
+#
 # Optional env:
 #   ZERON_EDGE_URL   (default: http://10.66.0.1:8787 — mael's homelab edge over WireGuard)
+#   ZERON_FORK_REPO  (default: MaelTtt/zeron-droid-selfhost-fork)
+#   FROM_SOURCE=1    (build from source instead of downloading a release; needs mold)
 #   SKIP_DAEMON=1    (don't install the systemd engine service)
 set -euo pipefail
 
-REPO="${REPO:-git@github.com:MaelTtt/zeron-droid-selfhost-fork.git}"
+FORK_REPO="${ZERON_FORK_REPO:-MaelTtt/zeron-droid-selfhost-fork}"
+REPO="${REPO:-git@github.com:$FORK_REPO.git}"
 CLONE_DIR="${CLONE_DIR:-$HOME/.build/zeron}"
 EDGE_URL="${ZERON_EDGE_URL:-http://10.66.0.1:8787}"
 
@@ -28,26 +35,19 @@ else echo "Unsupported distro (need pacman/apt/dnf)."; exit 1; fi
 
 say "[$DISTRO] development dependencies"
 case "$DISTRO" in
-  arch)   sudo pacman -S --needed --noconfirm base-devel clang pkgconf git \
+  arch)   sudo pacman -S --needed --noconfirm base-devel clang mold pkgconf git \
               libxkbcommon libxkbcommon-x11 wayland libxcb fontconfig \
               webkit2gtk-4.1 ;;
   debian) sudo apt-get update -qq && sudo apt-get install -y -qq \
-              build-essential clang libclang-dev pkg-config git curl \
+              build-essential clang libclang-dev mold pkg-config git curl \
               libssl-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-0 \
               libxcb1-dev libfontconfig1-dev libfreetype-dev \
               libwebkit2gtk-4.1-dev libjson-glib-dev ;;
-  fedora) sudo dnf install -y clang clang-devel pkgconf-pkg-config git \
+  fedora) sudo dnf install -y clang clang-devel mold pkgconf-pkg-config git \
               openssl-devel wayland-devel libxkbcommon-devel libxkbcommon-x11-devel \
               libxcb-devel fontconfig-devel freetype-devel \
               webkit2gtk4.1-devel json-glib-devel ;;
 esac
-
-say "rust toolchain"
-if ! command -v cargo >/dev/null; then
-    curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-    export PATH="$HOME/.cargo/bin:$PATH"
-fi
-rustc --version
 
 say "clone/pull fork into $CLONE_DIR"
 mkdir -p "$(dirname "$CLONE_DIR")"
@@ -61,10 +61,52 @@ else
 fi
 cd "$CLONE_DIR"
 
-say "build (release; grab a coffee, ~10-20 min)"
-cargo build --release -p zeron
+# Newest `-mael.N` GitHub release (built by .github/workflows/fork-release.yml),
+# unpacked into a temp dir with its sha256 checked against manifest.json.
+# Sets BUILT on success.
+fetch_fork_release() {
+    local arch tag ver base name tmp want got
+    arch="$(uname -m)"
+    tag="$(curl -fsSL "https://api.github.com/repos/$FORK_REPO/releases?per_page=20" \
+        | grep -o '"tag_name": *"v[^"]*-mael\.[0-9]*"' \
+        | sed 's/.*"\(v[^"]*\)"$/\1/' | sort -V | tail -n 1)" || return 1
+    [ -n "$tag" ] || return 1
+    ver="${tag#v}"
+    base="https://github.com/$FORK_REPO/releases/download/$tag"
+    name="zeron-$ver-linux-$arch.tar.gz"
+    tmp="$(mktemp -d)"
+    say "downloading $tag ($arch)"
+    curl -fsSL "$base/$name" -o "$tmp/$name" || return 1
+    curl -fsSL "$base/manifest.json" -o "$tmp/manifest.json" || return 1
+    want="$(tr -d ' \n\t' < "$tmp/manifest.json" \
+        | grep -o "\"$name\":{\"sha256\":\"[0-9a-f]*\"" | grep -o '[0-9a-f]\{64\}')"
+    got="$(sha256sum "$tmp/$name" | cut -d' ' -f1)"
+    if [ -z "$want" ] || [ "$want" != "$got" ]; then
+        echo "checksum mismatch for $name" >&2
+        return 1
+    fi
+    tar -xzf "$tmp/$name" -C "$tmp" || return 1
+    BUILT="$tmp/zeron-$ver-linux-$arch/zeron"
+    [ -x "$BUILT" ]
+}
 
-BUILT="$CLONE_DIR/target/release/zeron"
+BUILT=""
+if [ "${FROM_SOURCE:-0}" != "1" ] && fetch_fork_release; then
+    say "using prebuilt release"
+else
+    [ "${FROM_SOURCE:-0}" = "1" ] || say "no usable prebuilt release — building from source"
+    say "rust toolchain"
+    if ! command -v cargo >/dev/null; then
+        curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+        export PATH="$HOME/.cargo/bin:$PATH"
+    fi
+    rustc --version
+    # .cargo/config.toml links x86_64 with mold; gcc needs `ld.mold` on PATH.
+    command -v ld.mold >/dev/null || { echo "install mold first (it provides ld.mold)" >&2; exit 1; }
+    say "build (release; grab a coffee, ~10-20 min)"
+    cargo build --release -p zeron
+    BUILT="$CLONE_DIR/target/release/zeron"
+fi
 NEWVER="$($BUILT --version | awk '{print \$2}')"
 
 say "install / update fork binary (versioned, no ETXTBSY)"
@@ -116,7 +158,19 @@ ls -1d "$HOME/.zeron/app/fork-"[0-9]* 2>/dev/null \
 
 export PATH="$HOME/.local/bin:$PATH"
 mkdir -p "$HOME/.local/bin"
-ln -sf "$HOME/.zeron/app/current/zeron" "$HOME/.local/bin/zeron"
+# Every launch path (terminal, desktop entry) must load ~/.zeron/env like the
+# systemd unit does, or the app resolves a different identity and opens a
+# different chat store.
+cat > "$HOME/.zeron/zeron-launch" <<'LAUNCH'
+#!/bin/sh
+# Every launch path must share the engine identity from ~/.zeron/env, or Zeron opens a different chat store.
+set -a
+[ -f "$HOME/.zeron/env" ] && . "$HOME/.zeron/env"
+set +a
+exec "$HOME/.zeron/app/current/zeron" "$@"
+LAUNCH
+chmod +x "$HOME/.zeron/zeron-launch"
+ln -sfn "$HOME/.zeron/zeron-launch" "$HOME/.local/bin/zeron"
 # fork update helper (rebase onto official releases + rebuild)
 cp "$CLONE_DIR/scripts/zeron-fork-update.sh" "$HOME/.local/bin/zeron-fork-update"
 chmod +x "$HOME/.local/bin/zeron-fork-update"
@@ -133,7 +187,7 @@ Type=Application
 Name=Zeron
 GenericName=Coding Agent Controller
 Comment=mael fork — droid + selfhost
-Exec=$HOME/.zeron/app/current/zeron %u
+Exec=$HOME/.zeron/zeron-launch %u
 TryExec=$HOME/.zeron/app/current/zeron
 # Absolute Icon: Qt/Vicinae ignores hicolor dirs with no index.theme, so a
 # themed Icon=zeron is unreliable — point straight at the file instead.
