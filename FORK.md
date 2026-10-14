@@ -11,7 +11,7 @@ releases.
 | 9c1673d6 | **Factory Droid as a first-class ACP harness** — `droid exec --output-format acp`, live model discovery, autonomy wiring | upstream PR #372 (rebased) |
 | 30df737d | Droid permission level persistence in the model picker | upstream PR #372 |
 | 8014e64d | **Self-host the edge with `AUTH_MODE=none`** — Docker edge relay (`docker-compose.selfhost.yml`, `edge/Dockerfile`, `edge/wrangler.selfhost.jsonc`, `docs/SELFHOST.md`); the engine accepts your own `ZERON_EDGE_URL` with no WorkOS/Zeron account | upstream PR #317 |
-| ba470911 | **Fork identity** — version `0.2.112-mael.1` (upstream base v0.2.112); `zeron update` refuses to overwrite the fork with *stock* while `ZERON_FORK` is set (points at `zeron-fork-update`), but one-click applies `-mael.N` releases from the fork feed (fork-aware staging into `fork-<version>/`); background auto-update disabled; `zeron status` shows the fork line | mael |
+| ba470911 | **Fork identity** — version `0.2.112-mael.2` (upstream base v0.2.112); `zeron update` refuses to overwrite the fork with *stock* while `ZERON_FORK` is set (points at `zeron-fork-update`), but one-click applies `-mael.N` releases from the fork feed (fork-aware staging into `fork-<version>/`); background auto-update disabled; `zeron status` shows the fork line | mael |
 | — | **Rewind** — rewind button in the hover strip under each sent message in the main transcript (click twice to confirm; side chats don't offer it) plus a double-Escape prompt list from the main composer. For Droid and OpenCode chats it truncates the transcript from that message and drops the agent's session (`RewindChat` RPC); the next run starts a fresh session bootstrapped with the remaining transcript. Files are not reverted. Other harnesses only get the prompt text back | upstream PR #384 + mael |
 | — | **Compact + open-in-terminal titlebar buttons** (OpenCode/Droid chats only) — compact opens the chat input's own model picker to choose the summarizer, then `CompactChat` (the pick never rewrites the chat's active model; a "Compacting this chat…" caption shows under the composer, failures surface as its error chip): OpenCode compacts through its own API (2.x: picked model applied to the session first, since compaction uses the session's model; 1.x: `/summarize` with the model in the body) and the engine keeps its spawned `opencode serve` alive until the session is idle again, Droid queues a `/compress` turn with the chat's sandbox. Also reachable from the context-window popup. The terminal button runs the native resume command (`opencode --session '<id>'` / `droid --resume '<id>'`) in a fresh embedded terminal tab, in the session's own cwd | mael |
 | 0502fe67 | 0.2.86 surface adaptation of the droid harness (install methods, skills dirs, spec fields, registry descriptor, auth test API) | mael |
@@ -26,7 +26,7 @@ When upstream #372 merges, the rebase will naturally drop what upstream already 
 
 ## Versioning
 
-- Fork version = `<upstream version>-mael.<n>` (currently `0.2.112-mael.1`), tag
+- Fork version = `<upstream version>-mael.<n>` (currently `0.2.112-mael.2`), tag
   `v<version>` on `main` (no slash — slashes break release downloads).
 - `version_newer` compares numeric cores first; on equal cores a higher
   `-mael.N` counts as newer **only when the installed build is itself a
@@ -50,7 +50,7 @@ too (it must match `Cargo.toml`). Public repo, so the CI minutes are free.
 #    0.2.102-mael.2 does NOT supersede 0.2.102 — see version_newer above).
 # 2. Commit and push; CI tags + publishes:
 git push origin main
-#    (or explicitly, tag has NO slash: git tag v0.2.112-mael.1 && git push origin main v0.2.112-mael.1)
+#    (or explicitly, tag has NO slash: git tag v0.2.112-mael.2 && git push origin main v0.2.112-mael.2)
 ```
 
 What **Update Zeron fork** does on the other devices: discovers the newest
@@ -94,7 +94,7 @@ other machines. Follow this checklist every time:
    this file (identity row + Versioning section). Run `cargo check` once
    so `Cargo.lock` follows the bump, and commit the lock too.
 3. Commit on `main`. If you tag by hand, tag **slashless**:
-   `git tag v<version>` (e.g. `v0.2.112-mael.1`). NEVER `mael/v<version>`
+   `git tag v<version>` (e.g. `v0.2.112-mael.2`). NEVER `mael/v<version>`
    — slashes break GitHub release-download URLs. `release.yml` ignores
    `v*-mael.*` tags, so only `fork-release.yml` fires.
 4. `git push origin main` (plus the tag if you made one) — CI builds
