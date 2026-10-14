@@ -696,9 +696,7 @@ impl InstallKind {
                 Ok(())
             }
             Self::Managed { app_root } if self.supports_desktop_update() => {
-                let version = staged
-                    .file_name()
-                    .and_then(|name| name.to_str())
+                let version = staged_dir_version(staged)
                     .context("staged install has no version directory")?;
                 apply_headless(app_root, version)?;
                 if relaunch {
@@ -963,6 +961,14 @@ fn versioned_dir_name_for(version: &str, fork: bool) -> String {
     } else {
         version.to_string()
     }
+}
+
+/// The bare version of a staged install dir. Fork dirs are named
+/// `fork-<ver>`, and [`apply_headless`] adds that prefix itself, so passing
+/// the dir name through unstripped would target `fork-fork-<ver>`.
+fn staged_dir_version(staged: &Path) -> Option<&str> {
+    let name = staged.file_name()?.to_str()?;
+    Some(name.strip_prefix("fork-").unwrap_or(name))
 }
 
 /// Marker content identifying a fork install dir (same text the desktop
@@ -2501,6 +2507,25 @@ mod tests {
         let plist = template.replace("__VERSION__", "0.3.1");
         assert_eq!(bundle_short_version(&plist).as_deref(), Some("0.3.1"));
         assert_eq!(bundle_short_version("<plist></plist>"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn applying_a_staged_fork_dir_does_not_double_the_fork_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_root = tmp.path().join("app");
+        let staged = app_root.join("fork-0.4.0-mael.1");
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(staged.join("zeron"), "").unwrap();
+        let version = staged_dir_version(&staged).unwrap();
+        assert_eq!(version, "0.4.0-mael.1");
+        apply_headless_for(&app_root, version, true).unwrap();
+        assert_eq!(std::fs::read_link(app_root.join("current")).unwrap(), staged);
+        assert_eq!(
+            staged_dir_version(&app_root.join("0.4.0")).unwrap(),
+            "0.4.0",
+            "stock dirs are untouched"
+        );
     }
 
     #[cfg(unix)]
