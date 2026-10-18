@@ -3497,9 +3497,11 @@ impl ElicitationForm {
                     .map(|(_, label)| label.clone())
                     .collect(),
                 prefill: None,
-                // The escape is a free-text answer, so the field holds one
-                // (and the panel may advance on typed text alone).
-                multiline: field.other_key.is_some(),
+                // `multiline` turns the panel into a bare editor that answers
+                // with the typed text alone, so a clicked option comes back
+                // empty and the form is cancelled. The panel's ordinary
+                // free-text override already carries the `_other` escape.
+                multiline: false,
                 multi_select: field.multi,
             })
             .collect()
@@ -6688,7 +6690,10 @@ mod tests {
         // `other` const the schema expects.
         assert_eq!(questions[0].options, vec!["Red", "Blue"]);
         assert!(!questions[0].multi_select);
-        assert!(questions[0].multiline);
+        assert!(
+            !questions[0].multiline,
+            "a multiline panel drops clicked options"
+        );
         assert_eq!(questions[1].id, "question_2");
         assert_eq!(questions[1].options, vec!["Warm", "Cold"]);
         assert!(questions[1].multi_select);
