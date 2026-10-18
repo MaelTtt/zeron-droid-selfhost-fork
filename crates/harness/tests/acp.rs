@@ -78,6 +78,48 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     (controls, steer_tx, token)
 }
 
+/// Controls whose input bridge answers by question id instead of saying "Yes"
+/// to everything, for the tests that drive the panel's own labels.
+fn controls_answering(
+    by_id: &[(&str, &[&str])],
+) -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
+    let by_id: Vec<(String, Vec<String>)> = by_id
+        .iter()
+        .map(|(id, labels)| {
+            (
+                (*id).to_owned(),
+                labels.iter().map(|label| (*label).to_owned()).collect(),
+            )
+        })
+        .collect();
+    let (steer_tx, steer_rx) = mpsc::channel(8);
+    let token = CancellationToken::new();
+    let controls = RunControls {
+        realtime: None,
+        execution_lease: None,
+        request_input: Box::new(move |questions| {
+            let (tx, rx) = oneshot::channel();
+            let answers: Vec<UserInputAnswer> = questions
+                .iter()
+                .map(|question| UserInputAnswer {
+                    question_id: question.id.clone(),
+                    labels: by_id
+                        .iter()
+                        .find(|(id, _)| id == &question.id)
+                        .map(|(_, labels)| labels.clone())
+                        .unwrap_or_default(),
+                })
+                .collect();
+            let _ = tx.send(answers);
+            rx
+        }),
+        steering: steer_rx,
+        interrupt: token.clone(),
+        turn: Default::default(),
+    };
+    (controls, steer_tx, token)
+}
+
 async fn run_to_end(
     harness: &AcpHarness,
     req: RunRequest,
@@ -1320,6 +1362,27 @@ async fn droid_spec_drives_the_shared_acp_wire() {
     assert!(events.contains(&AgentEvent::TextDelta {
         text: "Hello".into()
     }));
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+}
+
+#[tokio::test]
+async fn droid_ask_user_elicitation_reaches_the_input_panel() {
+    // Factory Droid asks for its AskUser answers over `elicitation/create` —
+    // and refuses to ask at all without the advertised capability (see the
+    // harness unit test). The fixture answers refusal unless the panel's
+    // labels come back as the schema's consts, `other` escape included.
+    let droid = AcpHarness::droid().with_executable(fixture_path());
+    let (controls, _steer, _token) = controls_answering(&[
+        ("question_1", &["Blue"]),
+        ("question_2", &["Warm", "Lukewarm"]),
+    ]);
+    let events = run_to_end(&droid, request("scenario:elicitation"), controls).await;
+    assert!(
+        events.contains(&AgentEvent::TextDelta {
+            text: "answered".into()
+        }),
+        "{events:?}"
+    );
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
 }
 
