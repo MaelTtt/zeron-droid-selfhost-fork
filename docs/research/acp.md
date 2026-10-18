@@ -80,6 +80,12 @@
   `auto-high`, matching the unattended fallback); a saved pick rides
   `model_options.autonomy_level`. Auth stays with Droid (`droid` login or
   `FACTORY_API_KEY`); zeron does not copy Factory credentials.
+  Its `AskUser` tool arrives as an ACP **form elicitation**
+  (`elicitation/create`), so initialize advertises
+  `clientCapabilities.elicitation.form` — for Droid only, and both halves are
+  required: without the capability Droid refuses to ask at all and fails the
+  tool call with "Error: Tool execution cancelled by user", with no request on
+  the wire (live-verified, CLI 0.244.0).
 - **ACP is the source of truth for model lists** (2026-08-08; preference
   order inverted 2026-08-09): `models()` runs a short-lived probe
   (initialize → `session/new`, the `discover_commands` pattern) and reads
@@ -127,6 +133,18 @@
   re-prompted the user for every command, 2026-08-09). The forced
   no-prompts mode matches per-adapter naming: claude `bypassPermissions`,
   codex `agent-full-access`.
+- `elicitation/create` (form mode; advertised in `initialize` for Droid only,
+  see above) → the engine's input bridge, the same route a question-shaped
+  permission request takes. The form's `question_<n>` properties become panel
+  questions — the `oneOf`/`anyOf` `const` titles are the options, the
+  `question_<n>_other` escape is the free-text answer — and panel labels map
+  back onto those `const`s in `{"action":"accept","content":…}`: a picked label
+  to its own `const`, a typed answer to `other` beside its text in the escape.
+  A dismissed panel, or a required question left unanswered, answers
+  `{"action":"cancel"}` rather than defaulting an answer the user never gave.
+  `url` mode is never advertised, `elicitation/complete` is not used, and a
+  form arriving outside a live run (setup, `session/load`, probes) is
+  dismissed — there is no panel to reach there.
 - **Session config options**: ACP has no per-prompt model field; the run's
   model + reasoning apply through `session/set_config_option` against the
   session response's advertised `configOptions` (category `model` /

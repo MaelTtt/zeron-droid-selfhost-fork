@@ -288,6 +288,23 @@ case "$promptline" in
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
   ;;
 
+*scenario:elicitation*)
+  # ACP form elicitation — Factory Droid's AskUser route. The panel's labels
+  # must map back onto the schema: a picked option to its `const`, a typed
+  # answer to the `other` escape beside its text (option_1 is "Blue", and the
+  # test's bridge picks it; option_0 is "Warm", plus its own answer).
+  emit "{\"id\":88,\"method\":\"elicitation/create\",\"params\":{\"sessionId\":\"$SID\",\"toolCallId\":\"ask-1\",\"mode\":\"form\",\"message\":\"Droid needs your answers to continue.\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{\"question_1\":{\"type\":\"string\",\"title\":\"Color\",\"description\":\"Which color, red or blue?\",\"oneOf\":[{\"const\":\"option_0\",\"title\":\"Red\"},{\"const\":\"option_1\",\"title\":\"Blue\"},{\"const\":\"other\",\"title\":\"Other answer\"}]},\"question_1_other\":{\"type\":\"string\",\"title\":\"Color: Other answer\"},\"question_2\":{\"type\":\"array\",\"title\":\"Extras\",\"description\":\"Which extras?\",\"items\":{\"anyOf\":[{\"const\":\"option_0\",\"title\":\"Warm\"},{\"const\":\"option_1\",\"title\":\"Cold\"},{\"const\":\"other\",\"title\":\"Other answer\"}]},\"minItems\":1,\"uniqueItems\":true},\"question_2_other\":{\"type\":\"string\",\"title\":\"Extras: Other answer\"}},\"required\":[\"question_1\",\"question_2\"]}}}"
+  read -r ans || exit 1
+  { has "$ans" '"id":88' \
+    && has "$ans" '"action":"accept"' \
+    && has "$ans" '"question_1":"option_1"' \
+    && has "$ans" '"question_2":["option_0","other"]' \
+    && has "$ans" '"question_2_other":"Lukewarm"'; } ||
+    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"answered"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
 *scenario:permission*)
   emit "{\"id\":77,\"method\":\"session/request_permission\",\"params\":{\"sessionId\":\"$SID\",\"toolCall\":{\"toolCallId\":\"t1\"},\"options\":[{\"optionId\":\"once\",\"name\":\"Allow once\",\"kind\":\"allow_once\"},{\"optionId\":\"always\",\"name\":\"Always allow\",\"kind\":\"allow_always\"},{\"optionId\":\"no\",\"name\":\"Reject\",\"kind\":\"reject_once\"}]}}"
   read -r ans || exit 1

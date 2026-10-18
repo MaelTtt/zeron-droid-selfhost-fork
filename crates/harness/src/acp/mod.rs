@@ -19,8 +19,9 @@
 //!   turn (`cancelled` → Interrupted, `refusal` → Errored, else Completed).
 //! - `session/update` notifications normalize per [`normalize::map_update`].
 //! - Permission requests auto-accept with the agent's preferred allow option
-//!   (zeron sessions run unattended); question-shaped requests block on the
-//!   engine's input bridge.
+//!   (zeron sessions run unattended); question-shaped requests and
+//!   `elicitation/create` forms (Factory Droid's `AskUser` tool) block on the
+//!   engine's input bridge instead.
 //! - Steering: agents advertising `_session/steering` get mid-turn injection;
 //!   others queue steers and deliver them as the next `session/prompt` at the
 //!   turn boundary. The session stays parked between turns while the
@@ -2681,6 +2682,14 @@ fn initialize_params(harness: HarnessId) -> Value {
         // separate subagentControl extension: Zeron has no matching UI yet.
         capabilities["_meta"] = json!({ "cognition.ai/subagentSupport": true });
     }
+    if harness == HarnessId::Droid {
+        // Factory Droid routes its own question tool (`AskUser`) through ACP
+        // form elicitation, and refuses to ask when the client doesn't
+        // advertise it: the tool call fails with "Error: Tool execution
+        // cancelled by user" and no request ever reaches us (live-verified,
+        // CLI 0.244.0). Only form mode is advertised — we never open a URL.
+        capabilities["elicitation"] = json!({ "form": {} });
+    }
     json!({
         "protocolVersion": 1,
         "clientInfo": {
@@ -3186,9 +3195,10 @@ fn prompt_turn(
 /// Answer a server→client request. Permission requests are auto-accepted with
 /// the agent's preferred allow option — parity with the claude harness's
 /// bypassPermissions and the codex harness's approvalPolicy "never" (zeron
-/// sessions run unattended). Everything else (fs, terminal, elicitation) was
-/// declined at initialize, so a stray request gets method-not-found rather
-/// than wedging the agent.
+/// sessions run unattended). Everything else (fs, terminal) was declined at
+/// initialize, so a stray request gets method-not-found rather than wedging
+/// the agent. Elicitation is advertised (see [`initialize_params`]) but only
+/// the live handler can answer it, so here it is dismissed.
 fn handle_server_request(
     client: &RpcClient,
     id: Value,
@@ -3209,6 +3219,12 @@ fn handle_server_request(
                 ),
                 None => client.respond(&id, json!({ "outcome": { "outcome": "cancelled" } })),
             }
+            Vec::new()
+        }
+        // Setup and probe paths (session/new, session/load, discovery) run
+        // without an input bridge, so a question there has no panel to reach.
+        "elicitation/create" => {
+            client.respond(&id, json!({ "action": "cancel" }));
             Vec::new()
         }
         _ => {
@@ -3242,10 +3258,11 @@ fn is_user_question(options: &[Value]) -> bool {
 }
 
 /// The live-run request handler: tool permissions auto-accept like
-/// [`handle_server_request`], but question-shaped requests block on the
-/// engine's input bridge (in a subtask so the message loop keeps flowing)
-/// and answer with the option whose name matches the chosen label. A dropped
-/// resolver degrades to `cancelled` — never a silent allow.
+/// [`handle_server_request`], but question-shaped requests and
+/// `elicitation/create` forms block on the engine's input bridge (in a
+/// subtask so the message loop keeps flowing) and answer with the option
+/// whose name matches the chosen label. A dropped resolver degrades to
+/// `cancelled` — never a silent allow.
 fn handle_server_request_live(
     client: &RpcClient,
     id: Value,
@@ -3254,6 +3271,11 @@ fn handle_server_request_live(
     request_input: &std::sync::Arc<RequestInputFn>,
     session_id: &str,
 ) -> Vec<AgentEvent> {
+    if method == "elicitation/create" {
+        // Answered with its own response shape, so it never rides the
+        // permission path below.
+        return handle_elicitation_live(client, id, params, request_input, session_id);
+    }
     if params
         .get("sessionId")
         .and_then(Value::as_str)
@@ -3321,6 +3343,323 @@ fn handle_server_request_live(
         }
     });
     Vec::new()
+}
+
+/// The `const` droid's form schema uses for its "Other answer" escape. Its
+/// label is kept off the option list — the panel's free-text field is that
+/// affordance — and the value is what a typed answer maps back to.
+const OTHER_ESCAPE: &str = "other";
+
+/// `elicitation/create` (ACP form mode) — the route Factory Droid's own
+/// `AskUser` tool takes. Questions arrive as a `requestedSchema` of
+/// `question_<n>` properties, each an enum of `const` choices with an
+/// optional `question_<n>_other` free-text escape. They bridge to the same
+/// input panel as a question-shaped permission request (in a subtask, so the
+/// message loop keeps flowing), and the panel's labels map back onto those
+/// consts in the `accept` response.
+fn handle_elicitation_live(
+    client: &RpcClient,
+    id: Value,
+    params: &Value,
+    request_input: &std::sync::Arc<RequestInputFn>,
+    session_id: &str,
+) -> Vec<AgentEvent> {
+    if params
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .is_some_and(|id| id != session_id)
+    {
+        client.respond(&id, json!({ "action": "cancel" }));
+        return Vec::new();
+    }
+    let form = ElicitationForm::parse(params);
+    // URL mode was never advertised (see `initialize_params`), and a form
+    // with nothing to ask would only ever collect an empty answer set: both
+    // are dismissed rather than parked on a panel that cannot answer them.
+    if form.fields.is_empty() {
+        client.respond(&id, json!({ "action": "cancel" }));
+        return Vec::new();
+    }
+    let client = client.clone();
+    let request_input = std::sync::Arc::clone(request_input);
+    tokio::spawn(async move {
+        let answers = (request_input)(form.questions()).await.unwrap_or_default();
+        client.respond(&id, form.response(&answers));
+    });
+    Vec::new()
+}
+
+/// One question of an `elicitation/create` form.
+struct ElicitationField {
+    /// Schema property name, which doubles as the bridge's question id.
+    key: String,
+    /// Panel header (the schema's `title`).
+    header: String,
+    /// Panel question (the schema's `description`, else the request message).
+    question: String,
+    /// The `question_<n>_other` escape, when the schema advertises one.
+    other_key: Option<String>,
+    /// Advertised choices as `(value, label)`, in schema order.
+    choices: Vec<(String, String)>,
+    multi: bool,
+    required: bool,
+}
+
+/// An `elicitation/create` form flattened to the engine's question shape.
+struct ElicitationForm {
+    fields: Vec<ElicitationField>,
+}
+
+impl ElicitationForm {
+    /// Parse `elicitation/create` params (tolerant, like the rest of this
+    /// wire). Anything that isn't a form — `url` mode above all — parses to
+    /// no fields, which [`handle_elicitation_live`] dismisses.
+    fn parse(params: &Value) -> Self {
+        let schema = params
+            .get("requestedSchema")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let properties = match params.get("mode").and_then(Value::as_str) {
+            Some("form") => schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default(),
+            _ => serde_json::Map::new(),
+        };
+        let required: Vec<String> = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let message = params
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or("The agent needs your input.");
+        let mut fields = Vec::new();
+        for (key, spec) in &properties {
+            // A `_other` property is answered beside its question (a lone one
+            // is a question of its own, and is asked like any other).
+            if is_escape_property(key, &properties) {
+                continue;
+            }
+            // An array question carries its choices on `items`; a scalar one
+            // on itself.
+            let choice_spec = match spec.get("type").and_then(Value::as_str) {
+                Some("array") => spec.get("items").unwrap_or(spec),
+                _ => spec,
+            };
+            let other_key = escape_key(key);
+            fields.push(ElicitationField {
+                key: key.clone(),
+                header: spec
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .filter(|title| !title.trim().is_empty())
+                    .unwrap_or(key)
+                    .to_owned(),
+                question: spec
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .filter(|question| !question.trim().is_empty())
+                    .unwrap_or(message)
+                    .to_owned(),
+                other_key: properties.contains_key(&other_key).then_some(other_key),
+                choices: elicitation_choices(choice_spec),
+                multi: spec.get("type").and_then(Value::as_str) == Some("array"),
+                required: required.contains(key),
+            });
+        }
+        // `serde_json::Map` is a BTreeMap, so the wire order is gone by now:
+        // droid numbers its questions `question_<n>`, and the panel must ask
+        // them in that order (question_2 before question_10).
+        fields.sort_by_key(|field| question_number(&field.key));
+        Self { fields }
+    }
+
+    /// The input panel's questions, in schema order.
+    fn questions(&self) -> Vec<UserInputQuestion> {
+        self.fields
+            .iter()
+            .map(|field| UserInputQuestion {
+                id: field.key.clone(),
+                header: field.header.clone(),
+                question: field.question.clone(),
+                options: field
+                    .choices
+                    .iter()
+                    .map(|(_, label)| label.clone())
+                    .collect(),
+                prefill: None,
+                // The escape is a free-text answer, so the field holds one
+                // (and the panel may advance on typed text alone).
+                multiline: field.other_key.is_some(),
+                multi_select: field.multi,
+            })
+            .collect()
+    }
+
+    /// The `accept`/`cancel` response for the panel's answers.
+    fn response(&self, answers: &[UserInputAnswer]) -> Value {
+        let labels_for = |key: &str| -> Vec<String> {
+            answers
+                .iter()
+                .find(|answer| answer.question_id == key)
+                .map(|answer| answer.labels.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|label| !label.trim().is_empty())
+                .collect()
+        };
+        // A dismissed panel (or a resolver that went away) answers nothing:
+        // `cancel` is the action for an interaction the user left un-answered.
+        if self
+            .fields
+            .iter()
+            .all(|field| labels_for(&field.key).is_empty())
+        {
+            return json!({ "action": "cancel" });
+        }
+        let mut content = serde_json::Map::new();
+        for field in &self.fields {
+            let labels = labels_for(&field.key);
+            if labels.is_empty() {
+                // Skipping a required question would hand the agent a partial
+                // form its own schema rejects, and defaulting it would answer
+                // on the user's behalf: dismiss instead.
+                if field.required {
+                    return json!({ "action": "cancel" });
+                }
+                continue;
+            }
+            field.write(&labels, &mut content);
+        }
+        json!({ "action": "accept", "content": Value::Object(content) })
+    }
+}
+
+impl ElicitationField {
+    /// Write this field's value(s) onto the form content: an advertised label
+    /// becomes its `const`; anything else is the user's own answer — it rides
+    /// the escape (`other` as the value, the text beside it), or stands as the
+    /// value itself when the schema advertises no escape.
+    fn write(&self, labels: &[String], content: &mut serde_json::Map<String, Value>) {
+        let mut values = Vec::new();
+        let mut typed = Vec::new();
+        for label in labels {
+            match self
+                .choices
+                .iter()
+                .find(|(_, advertised)| advertised == label)
+            {
+                Some((value, _)) => values.push(value.clone()),
+                None if self.other_key.is_some() => {
+                    values.push(OTHER_ESCAPE.to_owned());
+                    typed.push(label.clone());
+                }
+                None => values.push(label.clone()),
+            }
+        }
+        if self.multi {
+            content.insert(
+                self.key.clone(),
+                Value::Array(values.into_iter().map(Value::String).collect()),
+            );
+        } else if let Some(value) = values.into_iter().next() {
+            // Single select: the panel collects exactly one label.
+            content.insert(self.key.clone(), Value::String(value));
+        }
+        if !typed.is_empty()
+            && let Some(other_key) = &self.other_key
+        {
+            content.insert(other_key.clone(), Value::String(typed.join("\n")));
+        }
+    }
+}
+
+/// The property name carrying a question's free-text escape.
+fn escape_key(key: &str) -> String {
+    format!("{key}_other")
+}
+
+/// Whether `key` is the escape of another property in this form.
+fn is_escape_property(key: &str, properties: &serde_json::Map<String, Value>) -> bool {
+    key.strip_suffix("_other")
+        .is_some_and(|question| !question.is_empty() && properties.contains_key(question))
+}
+
+/// `question_<n>`'s place in the form; anything else keeps its map order,
+/// after the numbered questions.
+fn question_number(key: &str) -> (u8, usize) {
+    match key
+        .strip_prefix("question_")
+        .and_then(|n| n.parse::<u8>().ok())
+    {
+        Some(number) => (0, usize::from(number)),
+        None => (1, 0),
+    }
+}
+
+/// The advertised choices of one elicitation property as `(value, label)`
+/// pairs. Droid spells them as `oneOf` variants carrying `const` + `title`; a
+/// plain `enum` (the spec's own example) works too, labelled by `enumNames`
+/// when present. The "other" escape is dropped: the panel answers it with
+/// free text, and its label would otherwise come back as literal text.
+fn elicitation_choices(spec: &Value) -> Vec<(String, String)> {
+    let variants: Vec<&Value> = spec
+        .get("oneOf")
+        .or_else(|| spec.get("anyOf"))
+        .and_then(Value::as_array)
+        .map(|list| list.iter().collect())
+        .unwrap_or_default();
+    if variants.is_empty() {
+        let names = spec.get("enumNames").and_then(Value::as_array);
+        return spec
+            .get("enum")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(ix, value)| {
+                        let value = value.as_str()?;
+                        if value == OTHER_ESCAPE {
+                            return None;
+                        }
+                        let label = names
+                            .and_then(|names| names.get(ix))
+                            .and_then(Value::as_str)
+                            .unwrap_or(value);
+                        Some((value.to_owned(), label.to_owned()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    variants
+        .into_iter()
+        .filter_map(|variant| {
+            let value = match variant.get("const")? {
+                Value::String(value) => value.clone(),
+                other => other.to_string(),
+            };
+            if value == OTHER_ESCAPE {
+                return None;
+            }
+            let label = variant
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or(&value)
+                .to_owned();
+            Some((value, label))
+        })
+        .collect()
 }
 
 /// Where an agent that signs in from settings sends a signed-out run: the
@@ -6254,6 +6593,204 @@ mod tests {
             json!({ "optionId": "b", "name": "Другое", "kind": "other" }),
         ];
         assert!(is_user_question(&mixed));
+    }
+
+    #[test]
+    fn only_droid_is_told_about_form_elicitation() {
+        // Droid refuses its AskUser tool outright — "Error: Tool execution
+        // cancelled by user", with nothing on the wire — unless the client
+        // advertises form elicitation (live-verified, CLI 0.244.0).
+        assert_eq!(
+            initialize_params(HarnessId::Droid)["clientCapabilities"]["elicitation"],
+            json!({ "form": {} })
+        );
+        // The other ACP agents keep their existing question routes until each
+        // one is verified against this handler.
+        for harness in [HarnessId::Grok, HarnessId::Devin, HarnessId::Hermes] {
+            assert!(
+                initialize_params(harness)["clientCapabilities"]
+                    .get("elicitation")
+                    .is_none(),
+                "{harness:?}"
+            );
+        }
+    }
+
+    /// The `AskUser` elicitation captured from `droid exec --output-format
+    /// acp` 0.244.0: a single-choice question and a multi-select one, each
+    /// with droid's `_other` free-text escape.
+    fn droid_ask_user_elicitation() -> Value {
+        json!({
+            "mode": "form",
+            "sessionId": "s-1",
+            "toolCallId": "call_1",
+            "message": "Droid needs your answers to continue.",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "question_1": {
+                        "type": "string",
+                        "title": "Color",
+                        "description": "Which color, red or blue?",
+                        "oneOf": [
+                            { "const": "option_0", "title": "Red" },
+                            { "const": "option_1", "title": "Blue" },
+                            { "const": "other", "title": "Other answer" }
+                        ]
+                    },
+                    "question_1_other": {
+                        "type": "string",
+                        "title": "Color: Other answer",
+                        "description": "Enter your answer here if you select Other answer."
+                    },
+                    "question_2": {
+                        "type": "array",
+                        "title": "Extras",
+                        "description": "Which extras?",
+                        "items": {
+                            "anyOf": [
+                                { "const": "option_0", "title": "Warm" },
+                                { "const": "option_1", "title": "Cold" },
+                                { "const": "other", "title": "Other answer" }
+                            ]
+                        },
+                        "minItems": 1,
+                        "uniqueItems": true
+                    },
+                    "question_2_other": {
+                        "type": "string",
+                        "title": "Extras: Other answer",
+                        "description": "Enter your answer here if you select Other answer."
+                    }
+                },
+                "required": ["question_1", "question_2"]
+            }
+        })
+    }
+
+    fn panel_answer(question_id: &str, labels: &[&str]) -> UserInputAnswer {
+        UserInputAnswer {
+            question_id: question_id.into(),
+            labels: labels.iter().map(|label| (*label).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn droid_ask_user_schema_becomes_panel_questions() {
+        let form = ElicitationForm::parse(&droid_ask_user_elicitation());
+        let questions = form.questions();
+        assert_eq!(questions.len(), 2, "the _other escapes are not questions");
+        assert_eq!(questions[0].id, "question_1");
+        assert_eq!(questions[0].header, "Color");
+        assert_eq!(questions[0].question, "Which color, red or blue?");
+        // "Other answer" is not a row: the panel's free-text field answers it,
+        // and selecting the row would send that literal label instead of the
+        // `other` const the schema expects.
+        assert_eq!(questions[0].options, vec!["Red", "Blue"]);
+        assert!(!questions[0].multi_select);
+        assert!(questions[0].multiline);
+        assert_eq!(questions[1].id, "question_2");
+        assert_eq!(questions[1].options, vec!["Warm", "Cold"]);
+        assert!(questions[1].multi_select);
+    }
+
+    #[test]
+    fn elicitation_answers_map_back_onto_the_schema() {
+        let form = ElicitationForm::parse(&droid_ask_user_elicitation());
+        // Picked labels become their `const`s; a typed answer rides the escape.
+        assert_eq!(
+            form.response(&[
+                panel_answer("question_1", &["Blue"]),
+                panel_answer("question_2", &["Warm", "Lukewarm"]),
+            ]),
+            json!({
+                "action": "accept",
+                "content": {
+                    "question_1": "option_1",
+                    "question_2": ["option_0", "other"],
+                    "question_2_other": "Lukewarm",
+                }
+            })
+        );
+        // The panel's free text wins over a pick, and a required question left
+        // unanswered dismisses the request instead of guessing an answer.
+        assert_eq!(
+            form.response(&[panel_answer("question_1", &["Teal"])]),
+            json!({ "action": "cancel" })
+        );
+    }
+
+    #[test]
+    fn elicitation_dismissal_cancels_and_url_mode_is_never_opened() {
+        let form = ElicitationForm::parse(&droid_ask_user_elicitation());
+        assert_eq!(form.response(&[]), json!({ "action": "cancel" }));
+        let url = json!({
+            "mode": "url",
+            "elicitationId": "oauth-1",
+            "url": "https://agent.example.com/connect",
+            "message": "Please authorize access to your repositories.",
+        });
+        assert!(ElicitationForm::parse(&url).fields.is_empty());
+    }
+
+    #[test]
+    fn elicitation_tolerates_the_specs_plain_enum_schema() {
+        // ACP's own example: a bare enum property, no `_other` escape.
+        let form = ElicitationForm::parse(&json!({
+            "mode": "form",
+            "message": "How should I approach this refactoring?",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "strategy": {
+                        "type": "string",
+                        "enum": ["conservative", "balanced", "aggressive"]
+                    }
+                },
+                "required": ["strategy"]
+            }
+        }));
+        let questions = form.questions();
+        assert_eq!(questions[0].id, "strategy");
+        assert_eq!(questions[0].header, "strategy");
+        assert_eq!(
+            questions[0].question,
+            "How should I approach this refactoring?"
+        );
+        assert_eq!(
+            questions[0].options,
+            vec!["conservative", "balanced", "aggressive"]
+        );
+        assert!(!questions[0].multiline);
+        assert_eq!(
+            form.response(&[panel_answer("strategy", &["balanced"])]),
+            json!({ "action": "accept", "content": { "strategy": "balanced" } })
+        );
+    }
+
+    #[test]
+    fn elicitation_asks_numbered_questions_in_order() {
+        // `serde_json::Map` is a BTreeMap, so `question_10` sorts before
+        // `question_2` unless the number itself orders the panel.
+        let properties = (1..=11)
+            .map(|n| {
+                (
+                    format!("question_{n}"),
+                    json!({ "type": "string", "title": format!("Q{n}") }),
+                )
+            })
+            .collect::<serde_json::Map<String, Value>>();
+        let form = ElicitationForm::parse(&json!({
+            "mode": "form",
+            "requestedSchema": { "type": "object", "properties": Value::Object(properties) },
+        }));
+        let headers: Vec<String> = form
+            .questions()
+            .into_iter()
+            .map(|question| question.header)
+            .collect();
+        let expected: Vec<String> = (1..=11).map(|n| format!("Q{n}")).collect();
+        assert_eq!(headers, expected);
     }
 
     #[test]
