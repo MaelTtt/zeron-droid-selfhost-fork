@@ -123,11 +123,93 @@ jobs:
           path: target/package/*.tar.gz
           if-no-files-found: error
 
+  android:
+    needs: [resolve]
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    # Cold: the Rust core for arm64 (thin LTO), bindings, Gradle, NDK 29.
+    timeout-minutes: 60
+    env:
+      NDK_VERSION: 29.0.14206865
+      # Phones: arm64 only (an x86_64 core would double the download).
+      ZERON_ANDROID_ABIS: arm64-v8a
+      # Published builds: thin LTO, stripped — the profile iOS archives use.
+      ZERON_ANDROID_PROFILE: mobile-dist
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+      - name: Android SDK packages
+        run: sdkmanager --install "platforms;android-37.0" "build-tools;37.0.0" "ndk;$NDK_VERSION"
+      - name: rust toolchain (rust-toolchain.toml)
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add aarch64-linux-android
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: android
+      - name: build tools (cargo-ndk, rsvg-convert)
+        run: |
+          cargo install cargo-ndk --locked
+          sudo apt-get update -q && sudo apt-get install -y -q librsvg2-bin
+
+      - id: version
+        name: version (Cargo.toml) and build number
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          # Only grows: Android installs a build over another only when it's higher.
+          echo "BUILD_NUMBER=$((1000 + GITHUB_RUN_NUMBER))" >> "$GITHUB_ENV"
+
+      - id: signing
+        name: release key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$KEYSTORE_PASSWORD" ] || [ -z "$KEY_ALIAS" ] || [ -z "$KEY_PASSWORD" ]; then
+            echo "No release key: signing with a throwaway debug key. The APK installs, but a later build won't install over it; add ANDROID_KEYSTORE_BASE64/PASSWORD/KEY_ALIAS/KEY_PASSWORD to the repo secrets for update-in-place."
+            exit 0
+          fi
+          keystore="$RUNNER_TEMP/zeron-release.jks"
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$keystore"
+          chmod 600 "$keystore"
+          {
+            echo "ZERON_ANDROID_KEYSTORE=$keystore"
+            echo "ZERON_ANDROID_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+            echo "ZERON_ANDROID_KEY_ALIAS=$KEY_ALIAS"
+            echo "ZERON_ANDROID_KEY_PASSWORD=$KEY_PASSWORD"
+          } >> "$GITHUB_ENV"
+
+      - name: assemble release APK
+        working-directory: apps/android
+        run: ./gradlew :app:assembleRelease -PzeronVersionCode="$BUILD_NUMBER" --console=plain --no-configuration-cache
+
+      - name: package
+        run: |
+          mkdir -p out/android
+          apk="out/android/zeron-$VERSION-android-arm64.apk"
+          cp apps/android/app/build/outputs/apk/release/app-release.apk "$apk"
+          (cd out/android && sha256sum "$(basename "$apk")" > "$(basename "$apk").sha256")
+          ls -la out/android
+          rm -f "$RUNNER_TEMP/zeron-release.jks"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fork-android
+          path: out/android/*
+          if-no-files-found: error
+
   publish:
     # Fork tag pushes, and main pushes carrying an untagged `-mael.N` version
     # (see `resolve`); workflow_dispatch builds artifacts without a release.
     if: needs.resolve.outputs.publish == 'true'
-    needs: [resolve, linux]
+    needs: [resolve, linux, android]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -148,6 +230,8 @@ jobs:
           for f in dist/zeron-"$ver"-linux-*.tar.gz; do
             test -f "$f" || { echo "missing artifact for tag v$ver (want zeron-$ver-linux-<arch>.tar.gz)"; exit 1; }
           done
+          test -f dist/zeron-"$ver"-android-arm64.apk \
+            || { echo "missing Android APK for tag v$ver (want zeron-$ver-android-arm64.apk)"; exit 1; }
           echo "VERSION=$ver" >> "$GITHUB_ENV"
       - name: updater manifest
         run: |

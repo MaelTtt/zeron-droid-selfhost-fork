@@ -47,6 +47,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import sh.zeron.android.core.AppModel
 import sh.zeron.android.design.ThemeMode
+import sh.zeron.android.design.ThemePreset
 import sh.zeron.android.design.ZIcon
 import sh.zeron.android.design.ZIcons
 import uniffi.zeron_core.coreVersion
@@ -151,6 +152,21 @@ fun SettingsScreen(
                                     Spacer(Modifier.size(ToggleButtonDefaults.IconSpacing))
                                     Text(label)
                                 }
+                            }
+                        }
+                        Spacer(Modifier.height(16.dp))
+                        Text("Palette", style = MaterialTheme.typography.titleMedium)
+                        Spacer(Modifier.height(12.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(ButtonGroupDefaults.ConnectedSpaceBetween)) {
+                            val presets = listOf(ThemePreset.Zeron to "Zeron", ThemePreset.BlackViolet to "Black Violet")
+                            presets.forEachIndexed { index, (preset, label) ->
+                                ToggleButton(
+                                    checked = appearance.preset == preset,
+                                    onCheckedChange = { model.setAppearance(appearance.copy(preset = preset)) },
+                                    modifier = Modifier.weight(1f).semantics { role = Role.RadioButton },
+                                    shapes = if (index == 0) ButtonGroupDefaults.connectedLeadingButtonShapes()
+                                    else ButtonGroupDefaults.connectedTrailingButtonShapes(),
+                                ) { Text(label) }
                             }
                         }
                     }
@@ -266,7 +282,7 @@ fun SettingsScreen(
                     shapes = segmentedShapes(1, 2),
                     colors = ListItemDefaults.segmentedColors(containerColor = cardColor()),
                     leadingContent = { IconTile(ZIcons.Logout, MaterialTheme.colorScheme.errorContainer, MaterialTheme.colorScheme.onErrorContainer) },
-                ) { Text(if (model.isDemo) "Leave demo" else "Sign out", color = MaterialTheme.colorScheme.error) }
+                ) { Text(if (model.isDemo) "Leave demo" else if (model.isSelfHost) "Disconnect" else "Sign out", color = MaterialTheme.colorScheme.error) }
             }
         }
     }
@@ -276,13 +292,18 @@ fun SettingsScreen(
         androidx.compose.material3.AlertDialog(
             onDismissRequest = { confirmSignOut = false },
             icon = { ZIcon(ZIcons.Logout, null) },
-            title = { Text("Sign out?") },
-            text = { Text("Local drafts stay on this device.") },
+            title = { Text(if (model.isSelfHost) "Disconnect?" else "Sign out?") },
+            text = {
+                Text(
+                    if (model.isSelfHost) "This device forgets the server address. Sessions stay on the server."
+                    else "Local drafts stay on this device.",
+                )
+            },
             confirmButton = {
                 androidx.compose.material3.TextButton(onClick = {
                     confirmSignOut = false
                     model.signOut()
-                }) { Text("Sign out", color = MaterialTheme.colorScheme.error) }
+                }) { Text(if (model.isSelfHost) "Disconnect" else "Sign out", color = MaterialTheme.colorScheme.error) }
             },
             dismissButton = { androidx.compose.material3.TextButton(onClick = { confirmSignOut = false }) { Text("Cancel") } },
         )

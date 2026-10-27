@@ -169,10 +169,20 @@ private fun zeronTypography(): Typography {
 
 enum class ThemeMode { System, Light, Dark }
 
-data class Appearance(val mode: ThemeMode = ThemeMode.System, val dynamicColor: Boolean = false)
+/** Color set: Zeron's own, or the desktop's Black Violet custom theme. */
+enum class ThemePreset { Zeron, BlackViolet }
+
+data class Appearance(
+    val mode: ThemeMode = ThemeMode.System,
+    val dynamicColor: Boolean = false,
+    val preset: ThemePreset = ThemePreset.Zeron,
+)
 
 /** Whether the resolved theme is dark (the transcript palette follows it). */
 val LocalDarkTheme = staticCompositionLocalOf { false }
+
+/** The active color preset (the transcript palette reads its syntax colors from it). */
+val LocalThemePreset = staticCompositionLocalOf { ThemePreset.Zeron }
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
@@ -184,13 +194,15 @@ fun ZeronTheme(appearance: Appearance = Appearance(), content: @Composable () ->
     }
     val context = LocalContext.current
     val scheme: ColorScheme = when {
+        // A chosen preset replaces Zeron's and dynamic color alike.
+        appearance.preset == ThemePreset.BlackViolet -> if (dark) BlackVioletDark else BlackVioletLight
         appearance.dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S ->
             if (dark) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
         dark -> ZeronDark
         else -> ZeronLight
     }
     val typography = remember { zeronTypography() }
-    CompositionLocalProvider(LocalDarkTheme provides dark) {
+    CompositionLocalProvider(LocalDarkTheme provides dark, LocalThemePreset provides appearance.preset) {
         MaterialExpressiveTheme(
             colorScheme = scheme,
             motionScheme = MotionScheme.expressive(),

@@ -13,10 +13,13 @@ import android.util.Log
 import kotlinx.coroutines.CompletableDeferred
 import sh.zeron.android.design.Appearance
 import sh.zeron.android.design.ThemeMode
+import sh.zeron.android.design.ThemePreset
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import uniffi.zeron_core.ConnectivityState
 import uniffi.zeron_core.ProjectView
@@ -83,7 +86,12 @@ data class LaunchOptions(
     val remoteVoice: Boolean = false,
     /** `--ez voice-selftest true`: log a host-less WebRTC offer (debuggable builds). */
     val voiceSelfTest: Boolean = false,
+    /** `--es edge <url>`: connect to a self-hosted edge (`AUTH_MODE=none`) without an account. */
+    val edge: String? = null,
 )
+
+/** A self-hosted edge (no account): the URL plus the identity it reports. */
+data class SelfHost(val url: String, val userId: String, val orgId: String)
 
 /**
  * App-wide state owner: holds the Rust [CoreClient], republishes its
@@ -95,6 +103,19 @@ class AppModel(private val app: Application) {
     private val main = Handler(Looper.getMainLooper())
     val credentials = CredentialStore(app)
     val wallpaper = WallpaperStore(app)
+
+    /** The self-hosted edge this device was pointed at (`AUTH_MODE=none`), if any. */
+    private val serverPrefs = app.getSharedPreferences("selfhost", 0)
+    val selfHost: SelfHost?
+        get() = serverPrefs.getString("url", null)?.let {
+            SelfHost(it, serverPrefs.getString("userId", "local")!!, serverPrefs.getString("orgId", "local")!!)
+        }
+    val selfHostUrl: String? get() = selfHost?.url
+    val isSelfHost: Boolean get() = selfHost != null && _client.value != null && !isDemo
+
+    /** Connecting to a self-hosted edge (the sign-in page's dialog). */
+    val serverConnecting = MutableStateFlow(false)
+    val serverError = MutableStateFlow<String?>(null)
 
     /** The app-wide voice call (one at a time, outlives screens). */
     val voice: sh.zeron.android.voice.VoiceController by lazy {
@@ -130,13 +151,18 @@ class AppModel(private val app: Application) {
         Appearance(
             runCatching { ThemeMode.valueOf(settings.getString("theme", "System")!!) }.getOrDefault(ThemeMode.System),
             settings.getBoolean("dynamicColor", false),
+            runCatching { ThemePreset.valueOf(settings.getString("preset", "Zeron")!!) }.getOrDefault(ThemePreset.Zeron),
         ),
     )
     val appearance: StateFlow<Appearance> = _appearance.asStateFlow()
 
     fun setAppearance(value: Appearance) {
         _appearance.value = value
-        settings.edit().putString("theme", value.mode.name).putBoolean("dynamicColor", value.dynamicColor).apply()
+        settings.edit()
+            .putString("theme", value.mode.name)
+            .putBoolean("dynamicColor", value.dynamicColor)
+            .putString("preset", value.preset.name)
+            .apply()
     }
 
     /** Sessions grouped by project in place of the flat Recent list. */
@@ -234,10 +260,16 @@ class AppModel(private val app: Application) {
         if (options.voicePreview && voice.preview() && options.voiceStage) voice.requestStage()
         if (options.voiceSelfTest) voice.selfTest()
         val stored = credentials.stored()
+        val edge = options.edge
         when {
+            // `--es edge <url>`: point this launch at a self-hosted edge (no account).
+            edge != null -> connectSelfHost(edge)
             // A `route` with nobody signed in opens on the demo (screenshots, tests).
-            options.demo || options.route != null && stored == null -> start(Credentials.Demo(demoOptions()))
+            options.demo || options.route != null && stored == null && selfHost == null ->
+                start(Credentials.Demo(demoOptions()))
             stored != null -> start(stored)
+            // A stored self-hosted server: reconnect with no login.
+            selfHost != null -> start(Credentials.Dev(selfHost!!.userId, selfHost!!.orgId))
         }
         // Relative times ("4m") and staleness age without events.
         scope.launch {
@@ -289,7 +321,9 @@ class AppModel(private val app: Application) {
         )
         return try {
             val client = CoreClient(config, credentials, listener)
-            if (credentials is Credentials.WorkOs) this.credentials.store(credentials)
+            // Self-hosted Dev credentials persist too: the next launch reconnects
+            // to the stored server with no login.
+            if (credentials is Credentials.WorkOs || credentials is Credentials.Dev) this.credentials.store(credentials)
             _client.value = client
             refreshWorkspace()
             client.preloadSessions()
@@ -306,7 +340,88 @@ class AppModel(private val app: Application) {
         start(Credentials.Demo(demoOptions()))
     }
 
-    val edgeUrl: String get() = authProductionEdgeUrl()
+    val edgeUrl: String get() = selfHost?.url ?: authProductionEdgeUrl()
+
+    /**
+     * Point this device at a self-hosted edge with `AUTH_MODE=none`: probe
+     * `/health`, adopt the identity the edge reports, and open the workspace.
+     * No WorkOS, no account. (The desktop engine reaches the same edge with
+     * `ZERON_EDGE_URL=<url> ZERON_WORKOS_CLIENT_ID=`.)
+     */
+    fun connectSelfHost(rawUrl: String) {
+        val url = normalizeEdgeUrl(rawUrl)
+        if (url == null) {
+            serverError.value = "Enter the server's address, e.g. http://192.168.1.20:8787"
+            return
+        }
+        if (serverConnecting.value) return
+        serverError.value = null
+        scope.launch {
+            serverConnecting.value = true
+            try {
+                val health = withContext(Dispatchers.IO) { probeEdge(url) }
+                if (!health.ok) {
+                    serverError.value = "That server isn't a Zeron edge."
+                    return@launch
+                }
+                if (health.auth != "none") {
+                    serverError.value = "This server needs an account (auth: ${health.auth}). Self-host uses AUTH_MODE=none."
+                    return@launch
+                }
+                serverPrefs.edit()
+                    .putString("url", url)
+                    .putString("userId", health.userId)
+                    .putString("orgId", health.orgId)
+                    .apply()
+                credentials.profile = CredentialStore.Profile("Self-hosted", null, health.orgId)
+                if (!start(Credentials.Dev(health.userId, health.orgId))) {
+                    serverError.value = "Couldn't open the server's workspace."
+                }
+            } catch (e: Exception) {
+                serverError.value = "Can't reach $url — ${e.message ?: "connection failed"}"
+            } finally {
+                serverConnecting.value = false
+            }
+        }
+    }
+
+    /** `host:port` / `https://host/` → a clean base URL; null when unusable. */
+    private fun normalizeEdgeUrl(raw: String): String? {
+        var value = raw.trim()
+        if (value.isEmpty()) return null
+        if (!value.contains("://")) value = "http://$value"
+        value = value.trimEnd('/')
+        return runCatching {
+            val parsed = java.net.URI(value)
+            if (parsed.scheme != "http" && parsed.scheme != "https") return null
+            if (parsed.host.isNullOrEmpty()) return null
+            value
+        }.getOrNull()
+    }
+
+    private data class EdgeHealth(val ok: Boolean, val auth: String, val userId: String, val orgId: String)
+
+    private fun probeEdge(base: String): EdgeHealth {
+        val conn = (java.net.URL("$base/health").openConnection() as java.net.HttpURLConnection).apply {
+            connectTimeout = 8_000
+            readTimeout = 8_000
+            requestMethod = "GET"
+            setRequestProperty("Accept", "application/json")
+        }
+        try {
+            val body = (if (conn.responseCode in 200..299) conn.inputStream else conn.errorStream)
+                ?.bufferedReader()?.use { it.readText() }.orEmpty()
+            val json = org.json.JSONObject(body)
+            return EdgeHealth(
+                ok = json.optBoolean("ok", false),
+                auth = json.optString("auth", ""),
+                userId = json.optString("userId", "local").ifEmpty { "local" },
+                orgId = json.optString("orgId", "local").ifEmpty { "local" },
+            )
+        } finally {
+            conn.disconnect()
+        }
+    }
 
     private val deviceId: String
         get() {
@@ -363,6 +478,8 @@ class AppModel(private val app: Application) {
             val user = exchange.user
             val name = listOfNotNull(user.firstName, user.lastName).map { it.trim() }.filter { it.isNotEmpty() }.joinToString(" ")
             credentials.profile = CredentialStore.Profile(name.ifEmpty { null }, user.email, org.name)
+            // A WorkOS account replaces any self-hosted server choice.
+            serverPrefs.edit().clear().apply()
             if (!start(Credentials.WorkOs(user.id, org.organizationId, tokens))) {
                 signInError.value = "Couldn't open your workspace. Try signing in again."
             }
@@ -404,6 +521,9 @@ class AppModel(private val app: Application) {
         _connectivity.value = null
         if (!wasDemo) {
             credentials.clear()
+            // Disconnecting a self-hosted server forgets it; the next launch
+            // shows the sign-in page rather than reconnecting silently.
+            serverPrefs.edit().clear().apply()
             if (forget) coreDir.deleteRecursively()
         }
         // Nothing of the account stays in memory (or seeds the next one's new session).
@@ -416,12 +536,17 @@ class AppModel(private val app: Application) {
         get() = when {
             isDemo -> "Demo"
             _client.value == null -> "Signed out"
+            isSelfHost -> "Self-hosted"
             else -> credentials.profile.let { it.name ?: it.email ?: "Signed in" }
         }
 
     val accountDetail: String
-        get() = if (isDemo) "Offline demo workspace" else credentials.profile.let { p ->
-            listOfNotNull(if (p.name != null) p.email else null, p.orgName).joinToString(" · ").ifEmpty { "Zeron account" }
+        get() = when {
+            isDemo -> "Offline demo workspace"
+            isSelfHost -> selfHost?.url ?: "Self-hosted server"
+            else -> credentials.profile.let { p ->
+                listOfNotNull(if (p.name != null) p.email else null, p.orgName).joinToString(" · ").ifEmpty { "Zeron account" }
+            }
         }
 
     // ── events ─────────────────────────────────────────────────────────────

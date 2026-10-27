@@ -10,7 +10,7 @@ import uniffi.zeron_core.ColorRole
  * affects layout. Neutrals are Zeron's (the iOS palette); accent roles follow
  * the Material scheme so wallpaper colors flow into links and quotes.
  */
-class TranscriptPalette(dark: Boolean, scheme: ColorScheme) {
+class TranscriptPalette(dark: Boolean, scheme: ColorScheme, preset: ThemePreset = ThemePreset.Zeron) {
     private val colors = IntArray(ColorRole.entries.size)
 
     val background: Int = scheme.background.toArgb()
@@ -73,6 +73,9 @@ class TranscriptPalette(dark: Boolean, scheme: ColorScheme) {
                 ColorRole.DIFF_DEL_BAR -> c(0xDC2626, 0xF87171, 0.55f)
                 ColorRole.DIFF_HUNK -> accent.copy(alpha = if (dark) 0.08f else 0.07f).toArgb()
             }
+        }
+        if (preset == ThemePreset.BlackViolet) {
+            for (role in ColorRole.entries) blackVioletSyntax(role, dark)?.let { colors[role.ordinal] = it.toInt() }
         }
     }
 }

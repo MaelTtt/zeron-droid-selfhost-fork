@@ -21,12 +21,17 @@ import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialShapes
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.toShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -43,6 +48,12 @@ fun SignInScreen(model: AppModel) {
     val context = LocalContext.current
     val error by model.signInError.collectAsState()
     val orgs by model.orgChoice.collectAsState()
+    val client by model.client.collectAsState()
+    val connecting by model.serverConnecting.collectAsState()
+    val serverError by model.serverError.collectAsState()
+    var serverDialog by remember { mutableStateOf(false) }
+    var serverUrl by remember { mutableStateOf(model.selfHostUrl ?: "") }
+    LaunchedEffect(client) { if (client != null) serverDialog = false }
     Column(
         Modifier.fillMaxSize().safeDrawingPadding().padding(horizontal = 28.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -82,6 +93,17 @@ fun SignInScreen(model: AppModel) {
         ) {
             Text("Explore the demo", style = ButtonDefaults.textStyleFor(ButtonDefaults.MediumContainerHeight))
         }
+        Spacer(Modifier.height(12.dp))
+        OutlinedButton(
+            onClick = {
+                model.serverError.value = null
+                serverDialog = true
+            },
+            modifier = Modifier.fillMaxWidth().heightIn(min = ButtonDefaults.MediumContainerHeight),
+            shapes = ButtonDefaults.shapes(),
+        ) {
+            Text("Self-hosted server", style = ButtonDefaults.textStyleFor(ButtonDefaults.MediumContainerHeight))
+        }
         error?.let {
             Spacer(Modifier.height(20.dp))
             Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center)
@@ -105,6 +127,45 @@ fun SignInScreen(model: AppModel) {
             },
             confirmButton = {},
             dismissButton = { TextButton(onClick = { choice.complete(null) }) { Text("Cancel") } },
+        )
+    }
+    if (serverDialog) {
+        AlertDialog(
+            onDismissRequest = { if (!connecting) serverDialog = false },
+            title = { Text("Self-hosted server") },
+            text = {
+                Column {
+                    Text(
+                        "Point this device at your Zeron edge (AUTH_MODE=none). No account needed.",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    OutlinedTextField(
+                        value = serverUrl,
+                        onValueChange = {
+                            serverUrl = it
+                            model.serverError.value = null
+                        },
+                        singleLine = true,
+                        label = { Text("Edge URL") },
+                        placeholder = { Text("http://192.168.1.20:8787") },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    serverError?.let {
+                        Spacer(Modifier.height(10.dp))
+                        Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = { model.connectSelfHost(serverUrl) },
+                    enabled = !connecting,
+                ) { Text(if (connecting) "Connecting…" else "Connect") }
+            },
+            dismissButton = {
+                TextButton(onClick = { serverDialog = false }, enabled = !connecting) { Text("Cancel") }
+            },
         )
     }
 }

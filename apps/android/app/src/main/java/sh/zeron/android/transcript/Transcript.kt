@@ -54,6 +54,7 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
 import sh.zeron.android.design.LocalDarkTheme
+import sh.zeron.android.design.LocalThemePreset
 import sh.zeron.android.design.ZIcons
 import sh.zeron.android.design.TranscriptPalette
 import uniffi.zeron_core.LayoutFrame
@@ -92,7 +93,8 @@ fun Transcript(state: TranscriptState, actions: TranscriptActions, modifier: Mod
     val d = density.density
     val scheme = MaterialTheme.colorScheme
     val dark = LocalDarkTheme.current
-    val palette = remember(scheme, dark) { TranscriptPalette(dark, scheme) }
+    val preset = LocalThemePreset.current
+    val palette = remember(scheme, dark, preset) { TranscriptPalette(dark, scheme, preset) }
     val interactions = remember { MutableInteractionSource() }
     val scrollable = rememberScrollableState { px -> -state.scrollBy(-px / d) * d }
     val overscroll = rememberOverscrollEffect()
