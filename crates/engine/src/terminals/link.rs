@@ -215,8 +215,11 @@ mod tests {
         let mut xs = 0usize;
         let mut tail = String::new();
         let mut last_seq = 0;
+        // The marker may sit in the same event as a prompt that pushes it out
+        // of the rolling window, so remember it once seen.
+        let mut done = false;
         tokio::time::timeout(Duration::from_secs(60), async {
-            while !tail.contains("FLOOD-DONE") {
+            while !done {
                 match link
                     .events
                     .recv()
@@ -228,10 +231,13 @@ mod tests {
                         last_seq = seq;
                         let bytes = BASE64.decode(data).unwrap();
                         xs += bytes.iter().filter(|b| **b == b'x').count();
-                        tail.push_str(&String::from_utf8_lossy(&bytes));
+                        let text = String::from_utf8_lossy(&bytes);
+                        done |= text.contains("FLOOD-DONE");
+                        tail.push_str(&text);
                         if tail.len() > 256 {
                             tail.drain(..tail.len() - 256);
                         }
+                        done |= tail.contains("FLOOD-DONE");
                     }
                     TerminalEvent::Exit { .. } => panic!("shell exited"),
                 }
