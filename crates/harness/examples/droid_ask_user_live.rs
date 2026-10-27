@@ -83,6 +83,7 @@ async fn main() {
         attachments: Vec::new(),
         worktree: None,
         resume: None,
+        env: Default::default(),
     };
     std::fs::create_dir_all("/tmp/acp-probe/ws").unwrap();
 

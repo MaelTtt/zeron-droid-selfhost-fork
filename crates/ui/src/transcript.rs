@@ -49,7 +49,7 @@ use crate::markdown::parser::{
 use crate::markdown::render::{self, RenderCache, RenderOptions};
 use crate::markdown::veil::RowVeil;
 use crate::motion::{self, AnimationExt as _};
-use crate::notice::{NoticeChipIcon::Tile, notice_chip_with_action};
+use crate::notice::{NoticeChipIcon::Tile, notice_chip, notice_chip_with_action};
 use crate::state::AppState;
 use crate::syntax_cache::{DocumentHighlightKey, SyntaxHighlightCache};
 use crate::theme::Theme;

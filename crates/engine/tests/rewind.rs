@@ -82,6 +82,7 @@ fn request(prompt: &str) -> RunRequest {
         resume: None,
         attachments: vec![],
         worktree: None,
+        env: Default::default(),
     }
 }
 
@@ -102,7 +103,7 @@ async fn rewind_truncates_and_the_next_run_forgets_the_rewound_turns() {
         )
         .unwrap();
     core.workspace
-        .set_chat_harness_session("main", "old-provider-session", "/tmp");
+        .set_chat_harness_session("main", "old-provider-session", "/tmp", None);
     let chat = core.doc_host.open("main").unwrap();
     for entry in [
         message("u1", MessageRole::User, "Remember PINEAPPLE"),

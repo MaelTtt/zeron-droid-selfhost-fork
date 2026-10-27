@@ -1526,10 +1526,11 @@ impl SessionsEngine {
             HarnessSessionRef {
                 session_id: String::new(),
                 cwd: cwd.clone(),
+                harness: None,
             },
         );
         if let Some(ws) = self.inner.workspace() {
-            ws.set_chat_harness_session(chat_id, "", &cwd);
+            ws.set_chat_harness_session(chat_id, "", &cwd, None);
         }
         doc.set_rewound()
             .map_err(|e| EngineError::Other(e.to_string()))?;

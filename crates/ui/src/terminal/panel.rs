@@ -1010,9 +1010,8 @@ impl TerminalPanel {
         if tab.exited.is_some() {
             return;
         }
-        if tab.coalescer.push(bytes) {
-            tab.flush_task = Some(Self::schedule_flush(chat.to_owned(), key, cx));
-        }
+        tab.input.push(bytes);
+        self.pump_input(chat, key, cx);
     }
 
     /// Send keyboard bytes from the active tab now (or right after the write

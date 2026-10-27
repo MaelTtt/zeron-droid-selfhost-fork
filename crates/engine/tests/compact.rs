@@ -103,6 +103,7 @@ fn request(prompt: &str) -> RunRequest {
         resume: None,
         attachments: vec![],
         worktree: None,
+        env: Default::default(),
     }
 }
 

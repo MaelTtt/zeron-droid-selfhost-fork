@@ -2782,6 +2782,7 @@ impl RpcService for EngineRpc {
                             resume: None,
                             attachments: Vec::new(),
                             worktree: None,
+                            env: Default::default(),
                         };
                         let command_id = self
                             .doc_host

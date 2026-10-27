@@ -34,11 +34,12 @@ pub enum HarnessId {
 
 impl HarnessId {
     /// Every harness, in declaration order.
-    pub const ALL: [HarnessId; 11] = [
+    pub const ALL: [HarnessId; 12] = [
         HarnessId::ClaudeCode,
         HarnessId::Codex,
         HarnessId::Cursor,
         HarnessId::Devin,
+        HarnessId::Droid,
         HarnessId::Grok,
         HarnessId::Hermes,
         HarnessId::Pi,
@@ -55,6 +56,7 @@ impl HarnessId {
             HarnessId::Codex => "codex",
             HarnessId::Cursor => "cursor",
             HarnessId::Devin => "devin",
+            HarnessId::Droid => "droid",
             HarnessId::Grok => "grok",
             HarnessId::Hermes => "hermes",
             HarnessId::Pi => "pi",
