@@ -148,6 +148,17 @@ jobs:
         run: |
           rustup show active-toolchain || rustup toolchain install
           rustup target add aarch64-linux-android
+      - name: mold linker (required by .cargo/config.toml)
+        # Host build scripts link with `-fuse-ld=mold` (see the linux job).
+        run: |
+          mkdir -p ~/.local/bin
+          arch="$(uname -m)"
+          ver="$(curl -fsSL -H "Authorization: Bearer ${{ github.token }}" https://api.github.com/repos/rui314/mold/releases/latest | jq -r .tag_name | sed 's/^v//')"
+          curl -fsSL "https://github.com/rui314/mold/releases/download/v${ver}/mold-${ver}-${arch}-linux.tar.gz" | tar xz
+          cp "mold-${ver}-${arch}-linux/bin/mold" ~/.local/bin/mold
+          ln -sf mold ~/.local/bin/ld.mold
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          ~/.local/bin/mold --version
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: android
